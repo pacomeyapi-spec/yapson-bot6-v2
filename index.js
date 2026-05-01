@@ -1,0 +1,711 @@
+'use strict';
+// ============================================================
+// YAPSON-BOT6-V2 — Clone de bot6 + F3 (YapsonSearch intégré)
+// ============================================================
+// F1 : Lecture et formatage des paiements YapsonPress
+// F2 : Confirmation automatique des dépôts en attente my-managment
+// F3 : Cycle complet automatique :
+//        1. Lire la date de la plus ancienne demande "Pending deposit requests"
+//        2. Récupérer paiements YapsonPress depuis cette date jusqu'à (now - F3_MARGIN_MIN)
+//        3. Marquer comme Approuvé dans YapsonPress ceux qui ne le sont pas
+//        4. Retourner sur my-managment → confirmer les demandes matchées (avec correction montant)
+//        5. Rejeter les demandes de plus de F3_REJECT_MIN minutes introuvables dans YapsonPress
+// ============================================================
+
+const express    = require('express');
+const fetch      = require('node-fetch');
+const { chromium } = require('playwright');
+
+const app  = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ── Variables d'environnement ─────────────────────────────────
+const YAPSON_TOKEN   = process.env.YAPSON_TOKEN   || '';
+const YAPSON_URL     = (process.env.YAPSON_URL    || 'https://sms-mirror-production.up.railway.app').replace(/\/$/, '');
+const MGMT_URL       = (process.env.MGMT_URL      || 'https://my-managment.com').replace(/\/$/, '');
+const MGMT_USER      = process.env.MGMT_USER      || '';
+const MGMT_PASS      = process.env.MGMT_PASS      || '';
+const FONCTION       = (process.env.FONCTION      || 'F1').toUpperCase();
+const SENDERS        = (process.env.SENDERS       || 'Wave Business,+454,MobileMoney,MoovMoney').split(',').map(s => s.trim());
+const INTERVAL_SEC   = parseInt(process.env.INTERVAL_SEC  || '30', 10);
+
+// F2 options
+const F2_CONF_MIN    = parseInt(process.env.F2_CONF_MIN   || '10', 10);
+const F2_REJ_ON      = process.env.F2_REJ_ON === 'true';
+const F2_REJ_MIN     = parseInt(process.env.F2_REJ_MIN    || '15', 10);
+
+// F3 options
+// F3_MARGIN_MIN : marge finale (valeurs autorisées : 2, 10, 15, 30 — défaut: 10)
+const F3_MARGIN_ALLOWED = [2, 10, 15, 30];
+const _f3margin = parseInt(process.env.F3_MARGIN_MIN || '10', 10);
+const F3_MARGIN_MIN  = F3_MARGIN_ALLOWED.includes(_f3margin) ? _f3margin : 10;
+// F3_REJECT_MIN : seuil de rejet des demandes introuvables (défaut: 50)
+const F3_REJECT_MIN  = parseInt(process.env.F3_REJECT_MIN || '50', 10);
+
+const PORT = parseInt(process.env.PORT || '3000', 10);
+
+// ── État global ───────────────────────────────────────────────
+let state = {
+  status:    'starting',
+  fonction:  FONCTION,
+  polls:     0,
+  confirmed: 0,
+  rejected:  0,
+  approved:  0,
+  errors:    0,
+  lastRun:   null,
+  logs:      [],
+  twofa:     false,
+  twofaCode: '',
+};
+
+function log(msg, level = 'info') {
+  const ts = new Date().toLocaleTimeString('fr-FR');
+  const entry = `[${ts}] ${msg}`;
+  console.log(entry);
+  state.logs.unshift(entry);
+  if (state.logs.length > 200) state.logs.pop();
+}
+
+// ── Utilitaires ───────────────────────────────────────────────
+function normPhone(s) {
+  const d = s.replace(/[^\d]/g, '');
+  if (d.length === 13 && d.startsWith('2250')) return d.slice(3);
+  if (d.length === 12 && d.startsWith('225'))  return '0' + d.slice(3);
+  return d;
+}
+
+function parseAmount(s) {
+  return parseInt(s.replace(/[\s\u00a0.,]/g, '').replace(/[^\d]/g, ''), 10) || 0;
+}
+
+function fmtAmt(n) {
+  return n.toLocaleString('fr-FR');
+}
+
+function parseYapsonDate(str) {
+  // Format attendu : "DD/MM/YYYY HH:MM" ou ISO
+  if (!str) return null;
+  const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})/);
+  if (m) {
+    return new Date(`${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}T${m[4].padStart(2,'0')}:${m[5]}:00`);
+  }
+  return new Date(str);
+}
+
+function parseMgmtDate(str) {
+  // Format my-managment : "DD/MM/YYYY HH:MM:SS" ou "YYYY-MM-DD HH:MM:SS"
+  if (!str) return null;
+  let m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})/);
+  if (m) {
+    return new Date(`${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}T${m[4].padStart(2,'0')}:${m[5]}:00`);
+  }
+  m = str.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/);
+  if (m) {
+    return new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00`);
+  }
+  return null;
+}
+
+// ── Parseurs SMS ──────────────────────────────────────────────
+function parseMsg(sender, content) {
+  if (sender === 'Wave Business') {
+    const m = content.match(/\((0\d{9})\)\s+a\s+pay[eé]\s+([\d\s\u00a0.,]+)\s*F/i);
+    if (m) return { phone: m[1], amount: parseAmount(m[2]) };
+  }
+  if (sender === '+454' || sender.includes('MobileMoney') || sender.includes('Orange')) {
+    const m = content.match(/(\d[\d\s\u00a0]+)\s*F.*?(0\d{9})/i)
+           || content.match(/(0\d{9}).*?(\d[\d\s\u00a0]+)\s*F/i);
+    if (m) {
+      const phone  = normPhone(m[1].replace(/[^\d]/g,'').length === 10 ? m[1] : m[2]);
+      const amtStr = m[1].replace(/[^\d]/g,'').length <= 6 ? m[2] : m[1];
+      return { phone, amount: parseAmount(amtStr) };
+    }
+  }
+  if (sender.includes('MoovMoney')) {
+    const m = content.match(/(0\d{9}).*?(\d[\d\s\u00a0]+)\s*FCFA/i)
+           || content.match(/(\d[\d\s\u00a0]+)\s*FCFA.*?(0\d{9})/i);
+    if (m) {
+      const digits1 = m[1].replace(/[^\d]/g,'');
+      const digits2 = m[2].replace(/[^\d]/g,'');
+      const phone  = digits1.length === 10 ? m[1].replace(/[^\d]/g,'') : digits2;
+      const amtStr = digits1.length <= 7    ? m[1] : m[2];
+      return { phone: normPhone(phone), amount: parseAmount(amtStr) };
+    }
+  }
+  // Pattern générique : numéro 10 chiffres + montant
+  const gen = content.match(/(0\d{9}).*?(\d[\d\s\u00a0]{2,})/);
+  if (gen) return { phone: gen[1], amount: parseAmount(gen[2]) };
+  return null;
+}
+
+// ── API YapsonPress ───────────────────────────────────────────
+async function yapsonFetchMessages(fromTs, toTs) {
+  const token = YAPSON_TOKEN || state.yapsonToken;
+  if (!token) throw new Error('YAPSON_TOKEN manquant');
+
+  const res = await fetch(`${YAPSON_URL}/api/messages`, {
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) throw new Error(`YapsonPress API ${res.status}`);
+  const data = await res.json();
+  const messages = data.messages || data.data || data || [];
+
+  return messages.filter(msg => {
+    if (!SENDERS.some(s => (msg.sender || '').includes(s))) return false;
+    const ts = new Date(msg.created_at || msg.date || msg.timestamp).getTime();
+    if (isNaN(ts)) return false;
+    return ts >= fromTs && ts <= toTs;
+  });
+}
+
+async function yapsonApprove(msgId) {
+  const token = YAPSON_TOKEN || state.yapsonToken;
+  const res = await fetch(`${YAPSON_URL}/api/messages/${msgId}/approve`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+  });
+  return res.ok;
+}
+
+// ── Playwright : session my-managment ────────────────────────
+let browser = null;
+let page    = null;
+
+async function ensureBrowser() {
+  if (!browser || !browser.isConnected()) {
+    log('🚀 Lancement Chromium…');
+    browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  }
+  if (!page || page.isClosed()) {
+    page = await browser.newPage();
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'fr-FR,fr;q=0.9' });
+  }
+}
+
+async function mgmtLogin() {
+  log('🔐 Connexion my-managment…');
+  await page.goto(`${MGMT_URL}/fr/login`, { waitUntil: 'networkidle', timeout: 30000 });
+
+  // Remplir identifiants
+  await page.fill('input[name="username"], input[type="text"]', MGMT_USER);
+  await page.fill('input[name="password"], input[type="password"]', MGMT_PASS);
+  await page.click('button[type="submit"], input[type="submit"]');
+  await page.waitForTimeout(2000);
+
+  // Vérifier 2FA
+  const url = page.url();
+  if (url.includes('2fa') || url.includes('otp') || url.includes('code')) {
+    log('📱 2FA requis — en attente du code…');
+    state.twofa   = true;
+    state.status  = 'waiting_2fa';
+    // Attendre jusqu'à 5 minutes que le code soit fourni
+    for (let i = 0; i < 300; i++) {
+      if (state.twofaCode) break;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    if (!state.twofaCode) throw new Error('2FA timeout');
+    const code = state.twofaCode;
+    state.twofaCode = '';
+    state.twofa     = false;
+    await page.fill('input[name="code"], input[type="text"], input[placeholder*="code" i]', code);
+    await page.click('button[type="submit"], input[type="submit"]');
+    await page.waitForTimeout(2000);
+  }
+
+  log('✅ Connecté à my-managment');
+  state.status = 'connected';
+}
+
+async function ensureLoggedIn() {
+  await ensureBrowser();
+  try {
+    const url = page.url();
+    if (!url.includes(MGMT_URL) || url.includes('login')) {
+      await mgmtLogin();
+    }
+  } catch {
+    await mgmtLogin();
+  }
+}
+
+// ── F1 : Formatage paiements YapsonPress ─────────────────────
+async function runF1() {
+  log('▶ F1 — Lecture paiements YapsonPress…');
+  const toTs   = Date.now();
+  const fromTs = toTs - (24 * 60 * 60 * 1000); // dernières 24h par défaut
+  const msgs   = await yapsonFetchMessages(fromTs, toTs);
+  const result = [];
+  for (const msg of msgs) {
+    const parsed = parseMsg(msg.sender, msg.body || msg.content || '');
+    if (parsed) result.push(`${parsed.phone} → ${fmtAmt(parsed.amount)} F`);
+  }
+  log(`F1 — ${result.length} paiement(s) formaté(s)`);
+  return result;
+}
+
+// ── F2 : Confirmation dépôts en attente ──────────────────────
+async function runF2() {
+  log('▶ F2 — Confirmation dépôts en attente…');
+  await ensureLoggedIn();
+
+  await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
+
+  // Désactiver auto-refresh, mettre 500 lignes
+  try {
+    const autoEl = await page.$('input[name="autorefresh"], #autorefresh');
+    if (autoEl) await autoEl.uncheck();
+    const selectEl = await page.$('select[name*="length"], select.dataTables_length');
+    if (selectEl) await selectEl.selectOption('500');
+    const applyBtn = await page.$('button:has-text("APPLIQUER"), input[value="APPLIQUER"]');
+    if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(1500); }
+  } catch(e) { log(`⚠ Setup tableau: ${e.message}`); }
+
+  // Lire le tableau
+  const rows = await page.$$eval('table tbody tr', trs => trs.map(tr => {
+    const cells = [...tr.querySelectorAll('td')].map(td => td.innerText.trim());
+    return cells;
+  }));
+
+  const now = Date.now();
+  let confirmed = 0;
+  let rejected  = 0;
+
+  for (const cells of rows) {
+    if (cells.length < 4) continue;
+    const phone    = normPhone(cells[1] || cells[0]);
+    const amtRaw   = cells[2] || cells[3];
+    const dateStr  = cells[0] || '';
+    const dateTs   = parseMgmtDate(dateStr)?.getTime() || 0;
+    const ageMin   = (now - dateTs) / 60000;
+
+    // Récupérer le bouton CONFIRMER ou REJETER de cette ligne
+    // TODO: adapter les sélecteurs selon la structure réelle du tableau
+    log(`F2 — Ligne: ${phone} | ${amtRaw} | âge: ${ageMin.toFixed(0)} min`);
+  }
+
+  log(`F2 — ${confirmed} confirmé(s), ${rejected} rejeté(s)`);
+  state.confirmed += confirmed;
+  state.rejected  += rejected;
+}
+
+// ── F3 : Cycle complet YapsonSearch automatique ──────────────
+async function runF3() {
+  log('▶ F3 — Cycle complet YapsonSearch…');
+  await ensureLoggedIn();
+
+  // ─── ÉTAPE 1 : Lire la date de la plus ancienne demande pending ───
+  log('F3 [1/5] Lecture du tableau Pending deposit requests…');
+  await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
+
+  // Désactiver auto-refresh, mettre 500 lignes
+  try {
+    const autoEl = await page.$('input[name="autorefresh"], #autorefresh, input[id*="auto"]');
+    if (autoEl) {
+      const checked = await autoEl.isChecked();
+      if (checked) await autoEl.click();
+    }
+    const selectEl = await page.$('select[name*="length"]');
+    if (selectEl) await selectEl.selectOption('500');
+    const applyBtn = await page.$('button:has-text("APPLIQUER"), input[value="APPLIQUER"]');
+    if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(1500); }
+  } catch(e) { log(`⚠ Setup tableau: ${e.message}`); }
+
+  // Extraire toutes les lignes en attente avec leur DATE DE CRÉATION
+  const pendingRows = await page.$$eval('table tbody tr', (trs) => {
+    return trs.map(tr => {
+      const cells = [...tr.querySelectorAll('td')].map(td => td.innerText.trim());
+      // Chercher le bouton "Confirmer" pour savoir si c'est bien une ligne pending
+      const hasConfirm = tr.innerText.toLowerCase().includes('confirmer')
+                      || tr.innerText.toLowerCase().includes('confirm');
+      return { cells, hasConfirm };
+    }).filter(r => r.hasConfirm && r.cells.length >= 3);
+  });
+
+  if (pendingRows.length === 0) {
+    log('F3 — Aucune demande en attente. Fin.');
+    return;
+  }
+  log(`F3 — ${pendingRows.length} demande(s) en attente trouvée(s)`);
+
+  // Trouver la plus ancienne date (colonne "DATE DE CRÉATION")
+  // On cherche la colonne qui contient une date (format DD/MM/YYYY)
+  const now = Date.now();
+  let oldestTs  = now;
+  let oldestStr = null;
+
+  for (const row of pendingRows) {
+    for (const cell of row.cells) {
+      const d = parseMgmtDate(cell);
+      if (d && !isNaN(d.getTime()) && d.getTime() < oldestTs) {
+        oldestTs  = d.getTime();
+        oldestStr = cell;
+      }
+    }
+  }
+
+  if (!oldestStr) {
+    log('F3 ❌ Impossible de lire la date de création. Fin.');
+    return;
+  }
+  log(`F3 — Plus ancienne demande : ${oldestStr} (il y a ${((now - oldestTs)/60000).toFixed(0)} min)`);
+
+  // ─── ÉTAPE 2 : Récupérer paiements YapsonPress dans la fenêtre de temps ───
+  const marginMin = f3Config.marginMin; // dynamique depuis dashboard
+  const rejectMin = f3Config.rejectMin;
+  const toTs   = now - (marginMin * 60 * 1000); // now - marge
+  const fromTs = oldestTs;
+
+  log(`F3 [2/5] Fetch YapsonPress de ${new Date(fromTs).toLocaleTimeString('fr-FR')} à ${new Date(toTs).toLocaleTimeString('fr-FR')} (marge ${marginMin}min)…`);
+
+  let yapMessages;
+  try {
+    yapMessages = await yapsonFetchMessages(fromTs, toTs);
+  } catch(e) {
+    log(`F3 ❌ Erreur YapsonPress: ${e.message}`);
+    return;
+  }
+  log(`F3 — ${yapMessages.length} message(s) YapsonPress dans la fenêtre`);
+
+  // Parser les paiements
+  const payments = []; // { phone, amount, msgId, approved }
+  for (const msg of yapMessages) {
+    const parsed = parseMsg(msg.sender || '', msg.body || msg.content || msg.message || '');
+    if (!parsed) continue;
+    payments.push({
+      phone:    parsed.phone,
+      amount:   parsed.amount,
+      msgId:    msg.id || msg._id,
+      approved: !!(msg.status === 'approved' || msg.approved || msg.is_approved),
+      sender:   msg.sender,
+    });
+  }
+  log(`F3 — ${payments.length} paiement(s) parsé(s) : ${payments.map(p => `${p.phone}→${fmtAmt(p.amount)}F`).join(' | ')}`);
+
+  // ─── ÉTAPE 3 : Marquer comme Approuvé dans YapsonPress ───
+  log('F3 [3/5] Approbation dans YapsonPress…');
+  let approvedCount = 0;
+  for (const p of payments) {
+    if (!p.approved && p.msgId) {
+      const ok = await yapsonApprove(p.msgId);
+      if (ok) { approvedCount++; p.approved = true; }
+    }
+  }
+  log(`F3 — ${approvedCount} paiement(s) approuvé(s) dans YapsonPress`);
+  state.approved += approvedCount;
+
+  // ─── ÉTAPE 4 : Retour my-managment → confirmer les demandes matchées ───
+  log('F3 [4/5] Confirmation des demandes dans my-managment…');
+
+  // Rester sur la page pending (ou renaviguer si besoin)
+  if (!page.url().includes('pendingrequestrefill')) {
+    await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(1000);
+  }
+
+  // Construire un map phone → amount depuis YapsonPress pour lookup rapide
+  const yapMap = {}; // phone → [{ amount, msgId }]
+  for (const p of payments) {
+    if (!yapMap[p.phone]) yapMap[p.phone] = [];
+    yapMap[p.phone].push(p);
+  }
+
+  let confirmedCount = 0;
+  let rejectedCount  = 0;
+
+  // Re-lire les lignes (la page peut avoir changé)
+  const rowHandles = await page.$$('table tbody tr');
+
+  for (const rowHandle of rowHandles) {
+    try {
+      const cells = await rowHandle.$$eval('td', tds => tds.map(td => td.innerText.trim()));
+      if (cells.length < 3) continue;
+
+      // Extraire phone et montant de la demande
+      let reqPhone  = null;
+      let reqAmount = null;
+      let reqDate   = null;
+
+      for (const cell of cells) {
+        const d = parseMgmtDate(cell);
+        if (d && !isNaN(d.getTime())) reqDate = d;
+
+        const phoneMatch = cell.match(/(0\d{9})/);
+        if (phoneMatch) reqPhone = normPhone(phoneMatch[1]);
+
+        if (!isNaN(parseAmount(cell)) && parseAmount(cell) > 100) {
+          reqAmount = parseAmount(cell);
+        }
+      }
+
+      if (!reqPhone) continue;
+      const ageMin = reqDate ? (now - reqDate.getTime()) / 60000 : 999;
+
+      // Chercher ce numéro dans les paiements YapsonPress
+      const matches = yapMap[reqPhone];
+
+      if (matches && matches.length > 0) {
+        // Trouver le match le plus proche en montant
+        const best = matches.reduce((a, b) =>
+          Math.abs(a.amount - (reqAmount||0)) <= Math.abs(b.amount - (reqAmount||0)) ? a : b
+        );
+
+        // Vérifier si montant correspond ou doit être corrigé
+        const montantCorrigé = best.amount;
+        const doitCorrigerMontant = reqAmount && reqAmount !== montantCorrigé;
+
+        if (doitCorrigerMontant) {
+          log(`F3 — Correction montant ${reqPhone}: ${fmtAmt(reqAmount)}F → ${fmtAmt(montantCorrigé)}F`);
+          // Chercher le champ montant dans la ligne et le corriger
+          try {
+            const amountInput = await rowHandle.$('input[type="number"], input[name*="amount"], input[name*="montant"]');
+            if (amountInput) {
+              await amountInput.fill('');
+              await amountInput.type(String(montantCorrigé));
+            }
+          } catch(e) { log(`⚠ Correction montant: ${e.message}`); }
+        }
+
+        // Cliquer Confirmer
+        try {
+          const confirmBtn = await rowHandle.$('button:has-text("Confirmer"), a:has-text("Confirmer"), input[value*="Confirm"]');
+          if (confirmBtn) {
+            await confirmBtn.click();
+            await page.waitForTimeout(800);
+
+            // Popup de confirmation
+            try {
+              const popupBtn = await page.waitForSelector(
+                'button:has-text("CONFIRM"), button:has-text("OUI"), button:has-text("Valider"), .swal2-confirm',
+                { timeout: 3000 }
+              );
+              if (popupBtn) await popupBtn.click();
+              await page.waitForTimeout(500);
+            } catch {}
+
+            confirmedCount++;
+            log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F`);
+          }
+        } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message}`); }
+
+      } else {
+        // ─── ÉTAPE 5 : Rejeter si > rejectMin minutes et introuvable ───
+        if (ageMin >= rejectMin) {
+          log(`F3 — Rejet: ${reqPhone} introuvable, âge ${ageMin.toFixed(0)} min >= ${rejectMin} min`);
+          try {
+            const rejectBtn = await rowHandle.$('button:has-text("Rejeter"), a:has-text("Rejeter"), input[value*="Rejet"]');
+            if (rejectBtn) {
+              await rejectBtn.click();
+              await page.waitForTimeout(800);
+
+              try {
+                const popupBtn = await page.waitForSelector(
+                  'button:has-text("REJETER"), button:has-text("OUI"), .swal2-confirm',
+                  { timeout: 3000 }
+                );
+                if (popupBtn) await popupBtn.click();
+                await page.waitForTimeout(500);
+              } catch {}
+
+              rejectedCount++;
+              log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
+            }
+          } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message}`); }
+        } else {
+          log(`F3 ⏳ En attente: ${reqPhone} introuvable mais âge ${ageMin.toFixed(0)} min < ${rejectMin} min`);
+        }
+      }
+    } catch(e) {
+      log(`⚠ Erreur ligne: ${e.message}`);
+    }
+  }
+
+  log(`F3 [5/5] ✅ Résultat : ${confirmedCount} confirmé(s), ${rejectedCount} rejeté(s), ${approvedCount} approuvé(s) YapsonPress`);
+  state.confirmed += confirmedCount;
+  state.rejected  += rejectedCount;
+}
+
+// ── Boucle principale ─────────────────────────────────────────
+async function mainLoop() {
+  log(`🤖 Bot démarré — Fonction: ${FONCTION} | Intervalle: ${INTERVAL_SEC}s`);
+  if (FONCTION === 'F3') {
+    log(`⚙ F3 config: marge=${F3_MARGIN_MIN}min | seuil rejet=${F3_REJECT_MIN}min`);
+  }
+  state.status = 'running';
+
+  while (true) {
+    try {
+      state.polls++;
+      state.lastRun = new Date().toISOString();
+
+      if (FONCTION === 'F1') {
+        await runF1();
+      } else if (FONCTION === 'F2') {
+        await runF2();
+      } else if (FONCTION === 'F3') {
+        await runF3();
+      } else {
+        log(`❌ FONCTION inconnue: ${FONCTION}`);
+      }
+    } catch(e) {
+      state.errors++;
+      log(`❌ Erreur cycle: ${e.message}`);
+      state.status = 'error';
+      // Tenter reconnexion
+      try { await mgmtLogin(); state.status = 'running'; } catch {}
+    }
+
+    await new Promise(r => setTimeout(r, INTERVAL_SEC * 1000));
+  }
+}
+
+// ── Dashboard HTTP ────────────────────────────────────────────
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yapson Bot6-V2 Dashboard</title>
+<meta http-equiv="refresh" content="10">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f1117;color:#e2e8f0;font-family:monospace;padding:20px}
+  h1{color:#89b4fa;font-size:1.3rem;margin-bottom:16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}
+  .card{background:#1e1e2e;border-radius:10px;padding:14px;text-align:center}
+  .card .val{font-size:1.6rem;font-weight:bold;color:#a6e3a1}
+  .card .lbl{font-size:11px;color:#6c7086;margin-top:4px}
+  .status{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:bold;margin-bottom:16px}
+  .status.running{background:#a6e3a1;color:#1e1e2e}
+  .status.error{background:#f38ba8;color:#1e1e2e}
+  .status.waiting_2fa{background:#fab387;color:#1e1e2e;animation:pulse 1s infinite}
+  .status.starting{background:#89b4fa;color:#1e1e2e}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+  .logs{background:#0a0e18;border-radius:10px;padding:14px;max-height:300px;overflow-y:auto}
+  .logs div{font-size:11.5px;color:#94a3b8;line-height:1.8;border-bottom:1px solid #1e1e2e;padding:2px 0}
+  form{background:#1e1e2e;border-radius:10px;padding:16px;margin-bottom:20px}
+  form h2{color:#fab387;font-size:13px;margin-bottom:10px}
+  input{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:8px 12px;font-size:13px;width:200px}
+  button{background:#89b4fa;color:#1e1e2e;border:none;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:bold;cursor:pointer;margin-left:8px}
+  .badge{display:inline-block;background:#313244;border-radius:6px;padding:2px 8px;font-size:11px;margin:2px}
+</style>
+</head>
+<body>
+<h1>🤖 Yapson Bot6-V2 Dashboard</h1>
+<span class="status {{STATUS_CLASS}}">{{STATUS_LABEL}}</span>
+<span class="badge">Fonction: {{FONCTION}}</span>
+<span class="badge">Polls: {{POLLS}}</span>
+<span class="badge">Dernière exécution: {{LAST_RUN}}</span>
+
+{{TWOFA_FORM}}
+
+{{F3_CONFIG_FORM}}
+
+<div class="grid">
+  <div class="card"><div class="val">{{CONFIRMED}}</div><div class="lbl">✅ Confirmés</div></div>
+  <div class="card"><div class="val">{{APPROVED}}</div><div class="lbl">🟢 Approuvés (YapsonPress)</div></div>
+  <div class="card"><div class="val">{{REJECTED}}</div><div class="lbl">❌ Rejetés</div></div>
+  <div class="card"><div class="val">{{ERRORS}}</div><div class="lbl">⚠ Erreurs</div></div>
+</div>
+
+<div class="logs">
+{{LOGS}}
+</div>
+
+</body>
+</html>`;
+
+// ── Config F3 dynamique (modifiable depuis le dashboard) ──────
+// Valeurs par défaut issues des variables d'environnement
+let f3Config = {
+  marginMin: F3_MARGIN_MIN,   // 2, 10, 15 ou 30
+  rejectMin: F3_REJECT_MIN,   // 50 par défaut
+};
+
+// runF3 lit f3Config au lieu des constantes figées
+// (déjà câblé via f3Config.marginMin et f3Config.rejectMin ci-dessous)
+
+app.get('/', (req, res) => {
+  const statusLabels = {
+    running:     '🟢 Actif',
+    error:       '🔴 Erreur',
+    waiting_2fa: '📱 2FA requis',
+    starting:    '🔵 Démarrage',
+    connected:   '🟢 Connecté',
+  };
+
+  const twoFaForm = state.twofa ? `
+<form method="POST" action="/2fa" style="background:#1e1e2e;border-radius:10px;padding:16px;margin-bottom:16px">
+  <div style="color:#fab387;font-size:13px;font-weight:bold;margin-bottom:10px">📱 Code 2FA requis</div>
+  <input name="code" type="text" maxlength="6" placeholder="6 chiffres" autofocus style="background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:8px 12px;font-size:13px;width:160px">
+  <button type="submit" style="background:#89b4fa;color:#1e1e2e;border:none;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:bold;cursor:pointer;margin-left:8px">Valider</button>
+</form>` : '';
+
+  // Formulaire de configuration F3 (visible uniquement si FONCTION=F3)
+  const f3ConfigForm = (FONCTION === 'F3') ? `
+<form method="POST" action="/f3-config" style="background:#1e1e2e;border-radius:10px;padding:14px;margin-bottom:16px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+  <span style="font-size:12px;color:#89b4fa;font-weight:bold">⚙ Config F3</span>
+  <label style="font-size:12px;color:#cdd6f4">
+    Marge YapsonPress :&nbsp;
+    <select name="marginMin" style="background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:6px 10px;font-size:13px">
+      ${[2,10,15,30].map(v => `<option value="${v}"${f3Config.marginMin===v?' selected':''}>${v} min</option>`).join('')}
+    </select>
+  </label>
+  <label style="font-size:12px;color:#cdd6f4">
+    Seuil rejet :&nbsp;
+    <select name="rejectMin" style="background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:6px 10px;font-size:13px">
+      ${[30,45,50,60].map(v => `<option value="${v}"${f3Config.rejectMin===v?' selected':''}>${v} min</option>`).join('')}
+    </select>
+  </label>
+  <button type="submit" style="background:#a6e3a1;color:#1e1e2e;border:none;border-radius:6px;padding:7px 14px;font-size:12px;font-weight:bold;cursor:pointer">Appliquer</button>
+  <span style="font-size:11px;color:#6c7086">Actuel : marge=${f3Config.marginMin}min | rejet>=${f3Config.rejectMin}min</span>
+</form>` : '';
+
+  const html = DASHBOARD_HTML
+    .replace('{{STATUS_CLASS}}',   state.status)
+    .replace('{{STATUS_LABEL}}',   statusLabels[state.status] || state.status)
+    .replace('{{FONCTION}}',       state.fonction)
+    .replace('{{POLLS}}',          state.polls)
+    .replace('{{LAST_RUN}}',       state.lastRun ? new Date(state.lastRun).toLocaleTimeString('fr-FR') : '—')
+    .replace('{{TWOFA_FORM}}',     twoFaForm)
+    .replace('{{F3_CONFIG_FORM}}', f3ConfigForm)
+    .replace('{{CONFIRMED}}',      state.confirmed)
+    .replace('{{APPROVED}}',       state.approved)
+    .replace('{{REJECTED}}',       state.rejected)
+    .replace('{{ERRORS}}',         state.errors)
+    .replace('{{LOGS}}',           state.logs.slice(0, 60).map(l => `<div>${l}</div>`).join(''));
+
+  res.send(html);
+});
+
+app.post('/2fa', (req, res) => {
+  const code = (req.body.code || '').trim();
+  if (code.length >= 4) {
+    state.twofaCode = code;
+    log(`📱 Code 2FA reçu: ${code}`);
+  }
+  res.redirect('/');
+});
+
+app.post('/f3-config', (req, res) => {
+  const allowed = [2, 10, 15, 30];
+  const newMargin = parseInt(req.body.marginMin || '10', 10);
+  const newReject = parseInt(req.body.rejectMin || '50', 10);
+  if (allowed.includes(newMargin)) {
+    f3Config.marginMin = newMargin;
+    log(`⚙ F3 marge mise à jour : ${newMargin} min`);
+  }
+  if (newReject >= 10 && newReject <= 120) {
+    f3Config.rejectMin = newReject;
+    log(`⚙ F3 seuil rejet mis à jour : ${newReject} min`);
+  }
+  res.redirect('/');
+});
+
+app.get('/status', (req, res) => res.json(state));
+
+app.listen(PORT, () => {
+  log(`🌐 Dashboard disponible sur le port ${PORT}`);
+  mainLoop().catch(e => { console.error('Fatal:', e); process.exit(1); });
+});
