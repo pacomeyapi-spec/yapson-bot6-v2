@@ -584,48 +584,36 @@ async function runF3() {
           } catch(e) { log(`⚠ Saisie montant: ${e.message.substring(0,60)}`); }
         }
 
-        // Confirmer : clic sur lien → modale s'ouvre → modifier montant → clic CONFIRMER
+        // Confirmer : vrai clic Playwright natif → modale → CONFIRMER
         try {
-          const allLinks = await rowHandle.$$('a');
-          let confirmBtn = null;
-          for (const lnk of allLinks) {
-            const txt = await lnk.innerText();
-            if (txt.trim() === 'Confirmer') { confirmBtn = lnk; break; }
-          }
-          if (!confirmBtn) { log(`F3 ⚠ Bouton Confirmer non trouvé pour ${reqPhone}`); continue; }
+          // Trouver le lien Confirmer de cette ligne via locator dans le handle
+          const confirmLocator = rowHandle.locator('a', { hasText: 'Confirmer' });
+          const confirmCount = await confirmLocator.count();
+          if (!confirmCount) { log(`F3 ⚠ Lien Confirmer non trouvé pour ${reqPhone}`); continue; }
 
-          await confirmBtn.scrollIntoViewIfNeeded();
-          await page.waitForTimeout(300);
-          await page.evaluate(el => el.click(), confirmBtn);
+          await confirmLocator.first().scrollIntoViewIfNeeded();
+          await page.waitForTimeout(200);
+          await confirmLocator.first().click();  // vrai clic Playwright natif
 
-          // Attendre la modale .modal_wrap
-          await page.waitForSelector('.modal_wrap', { timeout: 5000, state: 'visible' });
-          await page.waitForTimeout(500);
+          // Attendre la modale
+          await page.waitForSelector('.modal_wrap', { timeout: 8000 });
+          await page.waitForTimeout(600);
 
-          // Si montant à corriger : modifier le champ input dans la modale
+          // Modifier le montant si nécessaire
           if (montantCorrigé && montantCorrigé !== reqAmount) {
             try {
-              const amountInput = await page.$('.modal_wrap input:not([type=hidden])');
-              if (amountInput) {
-                await amountInput.triple_click();
-                await amountInput.fill(String(montantCorrigé));
-                await page.waitForTimeout(200);
-              }
-            } catch(e) { log(`⚠ Saisie montant modale: ${e.message.substring(0,50)}`); }
+              const amountInput = page.locator('.modal_wrap input').first();
+              await amountInput.clear();
+              await amountInput.fill(String(montantCorrigé));
+              await page.waitForTimeout(200);
+            } catch(e) { /* ignore */ }
           }
 
-          // Cliquer le bouton CONFIRMER dans la modale (texte exact)
-          const modalConfirmBtn = await page.$('.modal_wrap button');
-          if (modalConfirmBtn) {
-            await page.evaluate(el => el.click(), modalConfirmBtn);
-            await page.waitForTimeout(1500);
-            confirmedCount++;
-            log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F`);
-          } else {
-            log(`F3 ⚠ Bouton CONFIRMER dans modale non trouvé pour ${reqPhone}`);
-            await page.keyboard.press('Escape');
-            await page.waitForTimeout(300);
-          }
+          // Cliquer CONFIRMER dans la modale (premier bouton = teal)
+          await page.locator('.modal_wrap button').first().click();
+          await page.waitForTimeout(1500);
+          confirmedCount++;
+          log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F`);
         } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message.substring(0,80)}`); }
 
       } else {
@@ -633,35 +621,24 @@ async function runF3() {
         if (ageMin >= rejectMin) {
           log(`F3 — Rejet: ${reqPhone} introuvable, âge ${ageMin.toFixed(0)} min >= ${rejectMin} min`);
           try {
-            // Rejeter : clic sur lien → modale s'ouvre → clic OK
-            const allLinks2 = await rowHandle.$$('a');
-            let rejectBtn = null;
-            for (const lnk of allLinks2) {
-              const txt = await lnk.innerText();
-              if (txt.trim() === 'Rejeter') { rejectBtn = lnk; break; }
-            }
-            if (!rejectBtn) { log(`F3 ⚠ Bouton Rejeter non trouvé pour ${reqPhone}`); continue; }
+            // Rejeter : vrai clic Playwright natif → modale → OK
+            const rejectLocator = rowHandle.locator('a', { hasText: 'Rejeter' });
+            const rejectCount = await rejectLocator.count();
+            if (!rejectCount) { log(`F3 ⚠ Lien Rejeter non trouvé pour ${reqPhone}`); continue; }
 
-            await rejectBtn.scrollIntoViewIfNeeded();
-            await page.waitForTimeout(300);
-            await page.evaluate(el => el.click(), rejectBtn);
+            await rejectLocator.first().scrollIntoViewIfNeeded();
+            await page.waitForTimeout(200);
+            await rejectLocator.first().click();  // vrai clic Playwright natif
 
             // Attendre la modale
-            await page.waitForSelector('.modal_wrap', { timeout: 5000, state: 'visible' });
-            await page.waitForTimeout(500);
+            await page.waitForSelector('.modal_wrap', { timeout: 8000 });
+            await page.waitForTimeout(600);
 
-            // Cliquer le premier bouton dans la modale (OK / CONFIRMER)
-            const modalRejectBtn = await page.$('.modal_wrap button');
-            if (modalRejectBtn) {
-              await page.evaluate(el => el.click(), modalRejectBtn);
-              await page.waitForTimeout(1500);
-              rejectedCount++;
-              log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
-            } else {
-              log(`F3 ⚠ Bouton OK dans modale rejet non trouvé pour ${reqPhone}`);
-              await page.keyboard.press('Escape');
-              await page.waitForTimeout(300);
-            }
+            // Cliquer OK (premier bouton de la modale rejet)
+            await page.locator('.modal_wrap button').first().click();
+            await page.waitForTimeout(1500);
+            rejectedCount++;
+            log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
           } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message.substring(0,80)}`); }
         } else {
           log(`F3 ⏳ En attente: ${reqPhone} introuvable mais âge ${ageMin.toFixed(0)} min < ${rejectMin} min`);
