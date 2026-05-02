@@ -96,15 +96,18 @@ function parseYapsonDate(str) {
 }
 
 function parseMgmtDate(str) {
-  // Format my-managment : "DD/MM/YYYY HH:MM:SS" ou "YYYY-MM-DD HH:MM:SS"
+  // Format my-managment : "2026-05-02 00:37:13" (YYYY-MM-DD HH:MM:SS — heure locale Abidjan UTC+0)
   if (!str) return null;
-  let m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})/);
+  // Format ISO-like: YYYY-MM-DD HH:MM:SS
+  let m = str.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})(?::(\d{2}))?/);
   if (m) {
-    return new Date(`${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}T${m[4].padStart(2,'0')}:${m[5]}:00`);
+    // Heure locale Abidjan = UTC, donc pas de décalage
+    return new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]||'00'}Z`);
   }
-  m = str.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/);
+  // Format DD/MM/YYYY HH:MM
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})/);
   if (m) {
-    return new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00`);
+    return new Date(`${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}T${m[4].padStart(2,'0')}:${m[5]}:00Z`);
   }
   return null;
 }
@@ -332,28 +335,39 @@ async function runF3() {
   log('F3 [1/5] Lecture du tableau Pending deposit requests…');
   await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
 
-  // Désactiver auto-refresh, mettre 500 lignes
+  // Désactiver auto-refresh (toggle Vue.js) et appliquer
   try {
-    const autoEl = await page.$('input[name="autorefresh"], #autorefresh, input[id*="auto"]');
-    if (autoEl) {
-      const checked = await autoEl.isChecked();
-      if (checked) await autoEl.click();
+    // Trouver le toggle "Mise à jour auto" et le désactiver s'il est ON
+    const toggleInput = await page.$('input[type="checkbox"].toggle, .toggle input, input#autoUpdate, input[class*="toggle"]');
+    if (toggleInput) {
+      const isOn = await toggleInput.isChecked();
+      if (isOn) await toggleInput.dispatchEvent('click');
+    } else {
+      // Chercher par le label visible
+      const toggleEl = await page.$('.toggle--is-checked, [class*="toggle"][class*="active"]');
+      if (toggleEl) await toggleEl.dispatchEvent('click');
     }
-    const selectEl = await page.$('select[name*="length"]');
-    if (selectEl) await selectEl.selectOption('500');
-    const applyBtn = await page.$('button:has-text("APPLIQUER"), input[value="APPLIQUER"]');
-    if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(1500); }
-  } catch(e) { log(`⚠ Setup tableau: ${e.message}`); }
+    await page.waitForTimeout(500);
+    // Appliquer pour charger les données
+    const applyBtn = await page.$('button:has-text("APPLIQUER")');
+    if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(2000); }
+  } catch(e) { log(`⚠ Setup tableau: ${e.message.substring(0,80)}`); }
 
-  // Extraire toutes les lignes en attente avec leur DATE DE CRÉATION
+  // Extraire toutes les lignes en attente
+  // Structure my-managment Pending deposit requests :
+  // col0=DATE DE CRÉATION (2026-05-02 00:37:13)
+  // col1=INFOS SUR L'UTILISATEUR (texte + numéro ex: "...effectué 0701556950")
+  // col2=MONTANT (3 000)
+  // col3=NOM DE LA BANQUE
+  // col4=PROCESSING TIME
+  // col5=CONFIRMER (lien)
+  // col6=REJETER (lien)
   const pendingRows = await page.$$eval('table tbody tr', (trs) => {
     return trs.map(tr => {
       const cells = [...tr.querySelectorAll('td')].map(td => td.innerText.trim());
-      // Chercher le bouton "Confirmer" pour savoir si c'est bien une ligne pending
-      const hasConfirm = tr.innerText.toLowerCase().includes('confirmer')
-                      || tr.innerText.toLowerCase().includes('confirm');
+      const hasConfirm = tr.innerText.includes('Confirmer') || tr.innerText.includes('Confirm');
       return { cells, hasConfirm };
-    }).filter(r => r.hasConfirm && r.cells.length >= 3);
+    }).filter(r => r.hasConfirm && r.cells.length >= 5);
   });
 
   if (pendingRows.length === 0) {
@@ -362,19 +376,19 @@ async function runF3() {
   }
   log(`F3 — ${pendingRows.length} demande(s) en attente trouvée(s)`);
 
-  // Trouver la plus ancienne date (colonne "DATE DE CRÉATION")
-  // On cherche la colonne qui contient une date (format DD/MM/YYYY)
+  // La plus ancienne = dernière ligne du tableau (triées par DATE DE CRÉATION desc)
+  // col0 format: "2026-05-02 00:37:13"
   const now = Date.now();
   let oldestTs  = now;
   let oldestStr = null;
 
   for (const row of pendingRows) {
-    for (const cell of row.cells) {
-      const d = parseMgmtDate(cell);
-      if (d && !isNaN(d.getTime()) && d.getTime() < oldestTs) {
-        oldestTs  = d.getTime();
-        oldestStr = cell;
-      }
+    const dateStr = row.cells[0]; // col0 = DATE DE CRÉATION
+    // Format: "2026-05-02 00:37:13" → ISO
+    const d = parseMgmtDate(dateStr);
+    if (d && !isNaN(d.getTime()) && d.getTime() < oldestTs) {
+      oldestTs  = d.getTime();
+      oldestStr = dateStr;
     }
   }
 
@@ -453,24 +467,30 @@ async function runF3() {
   for (const rowHandle of rowHandles) {
     try {
       const cells = await rowHandle.$$eval('td', tds => tds.map(td => td.innerText.trim()));
-      if (cells.length < 3) continue;
+      if (cells.length < 5) continue;
 
-      // Extraire phone et montant de la demande
+      // Structure confirmée par inspection visuelle :
+      // col0 = DATE DE CRÉATION  ex: "2026-05-02 00:37:13"
+      // col1 = INFOS UTILISATEUR ex: "Votre numéro...effectué 0701556950"
+      // col2 = MONTANT           ex: "3 000"
+      // col3 = NOM DE LA BANQUE  ex: "Orange Money #166059"
+      // col4 = PROCESSING TIME   ex: "less than 1 minute" / "4 minutes"
+      // col5 = CONFIRMER (lien)
+      // col6 = REJETER (lien)
+
       let reqPhone  = null;
       let reqAmount = null;
       let reqDate   = null;
 
-      for (const cell of cells) {
-        const d = parseMgmtDate(cell);
-        if (d && !isNaN(d.getTime())) reqDate = d;
+      // col0 → date de création
+      reqDate = parseMgmtDate(cells[0]);
 
-        const phoneMatch = cell.match(/(0\d{9})/);
-        if (phoneMatch) reqPhone = normPhone(phoneMatch[1]);
+      // col1 → numéro de téléphone (10 chiffres commençant par 0)
+      const phoneMatch = cells[1].match(/(0\d{9})/);
+      if (phoneMatch) reqPhone = normPhone(phoneMatch[1]);
 
-        if (!isNaN(parseAmount(cell)) && parseAmount(cell) > 100) {
-          reqAmount = parseAmount(cell);
-        }
-      }
+      // col2 → montant
+      reqAmount = parseAmount(cells[2]);
 
       if (!reqPhone) continue;
       const ageMin = reqDate ? (now - reqDate.getTime()) / 60000 : 999;
@@ -500,51 +520,69 @@ async function runF3() {
           } catch(e) { log(`⚠ Correction montant: ${e.message}`); }
         }
 
-        // Cliquer Confirmer
+        // Cliquer Confirmer (liens <a> avec texte exact)
         try {
-          const confirmBtn = await rowHandle.$('button:has-text("Confirmer"), a:has-text("Confirmer"), input[value*="Confirm"]');
+          const confirmLink = await rowHandle.$('a');
+          let confirmBtn = null;
+          // Chercher le lien "Confirmer" parmi tous les liens de la ligne
+          const allLinks = await rowHandle.$$('a');
+          for (const lnk of allLinks) {
+            const txt = await lnk.innerText();
+            if (txt.trim() === 'Confirmer') { confirmBtn = lnk; break; }
+          }
           if (confirmBtn) {
-            await confirmBtn.click();
-            await page.waitForTimeout(800);
+            // Utiliser dispatchEvent pour contourner les overlays Vue.js
+            await confirmBtn.dispatchEvent('click');
+            await page.waitForTimeout(1200);
 
-            // Popup de confirmation
+            // Popup de confirmation SweetAlert / modale
             try {
               const popupBtn = await page.waitForSelector(
-                'button:has-text("CONFIRM"), button:has-text("OUI"), button:has-text("Valider"), .swal2-confirm',
-                { timeout: 3000 }
+                '.swal2-confirm, button.btn-success, button:has-text("OUI"), button:has-text("Confirmer"), button:has-text("OK")',
+                { timeout: 4000 }
               );
-              if (popupBtn) await popupBtn.click();
-              await page.waitForTimeout(500);
+              if (popupBtn) { await popupBtn.dispatchEvent('click'); }
+              await page.waitForTimeout(800);
             } catch {}
 
             confirmedCount++;
             log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F`);
+          } else {
+            log(`F3 ⚠ Bouton Confirmer non trouvé pour ${reqPhone}`);
           }
-        } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message}`); }
+        } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message.substring(0,80)}`); }
 
       } else {
         // ─── ÉTAPE 5 : Rejeter si > rejectMin minutes et introuvable ───
         if (ageMin >= rejectMin) {
           log(`F3 — Rejet: ${reqPhone} introuvable, âge ${ageMin.toFixed(0)} min >= ${rejectMin} min`);
           try {
-            const rejectBtn = await rowHandle.$('button:has-text("Rejeter"), a:has-text("Rejeter"), input[value*="Rejet"]');
+            // Chercher le lien "Rejeter" parmi tous les liens de la ligne
+            const allLinks2 = await rowHandle.$$('a');
+            let rejectBtn = null;
+            for (const lnk of allLinks2) {
+              const txt = await lnk.innerText();
+              if (txt.trim() === 'Rejeter') { rejectBtn = lnk; break; }
+            }
             if (rejectBtn) {
-              await rejectBtn.click();
-              await page.waitForTimeout(800);
+              await rejectBtn.dispatchEvent('click');
+              await page.waitForTimeout(1200);
 
               try {
                 const popupBtn = await page.waitForSelector(
-                  'button:has-text("REJETER"), button:has-text("OUI"), .swal2-confirm',
-                  { timeout: 3000 }
+                  '.swal2-confirm, button.btn-danger, button:has-text("OUI"), button:has-text("Rejeter"), button:has-text("OK")',
+                  { timeout: 4000 }
                 );
-                if (popupBtn) await popupBtn.click();
-                await page.waitForTimeout(500);
+                if (popupBtn) { await popupBtn.dispatchEvent('click'); }
+                await page.waitForTimeout(800);
               } catch {}
 
               rejectedCount++;
               log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
+            } else {
+              log(`F3 ⚠ Bouton Rejeter non trouvé pour ${reqPhone}`);
             }
-          } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message}`); }
+          } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message.substring(0,80)}`); }
         } else {
           log(`F3 ⏳ En attente: ${reqPhone} introuvable mais âge ${ageMin.toFixed(0)} min < ${rejectMin} min`);
         }
