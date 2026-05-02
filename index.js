@@ -280,6 +280,49 @@ async function ensureLoggedIn() {
   }
 }
 
+// ── API my-managment : Confirmer et Rejeter directement ──────
+
+async function mgmtConfirm(rowData) {
+  // POST /admin/banktransfer/approvemoney via page.evaluate (utilise les cookies de session)
+  // rowData: { id, summa, summaUser, reportId, subagentId, currency }
+  const result = await page.evaluate(async (data) => {
+    const fd = new FormData();
+    fd.append('id',          String(data.id));
+    fd.append('summa',       String(data.summa));       // montant YapsonPress
+    fd.append('summa_user',  String(data.summaUser));   // montant original my-managment
+    fd.append('comment',     '');
+    fd.append('is_out',      'false');
+    fd.append('report_id',   data.reportId  || '');
+    fd.append('subagent_id', data.subagentId|| '');
+    fd.append('currency',    data.currency  || '');
+    const res = await new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/admin/banktransfer/approvemoney');
+      xhr.onload = () => resolve({ status: xhr.status, response: xhr.responseText.substring(0, 200) });
+      xhr.onerror = () => resolve({ status: 0, response: 'error' });
+      xhr.send(fd);
+    });
+    return res;
+  }, rowData);
+  return result;
+}
+
+async function mgmtReject(id) {
+  // POST /admin/banktransfer/rejectmoney via page.evaluate
+  const result = await page.evaluate(async (reqId) => {
+    const res = await new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/admin/banktransfer/rejectmoney');
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.onload = () => resolve({ status: xhr.status, response: xhr.responseText.substring(0, 200) });
+      xhr.onerror = () => resolve({ status: 0, response: 'error' });
+      xhr.send(JSON.stringify({ id: reqId, comment: '', is_out: false }));
+    });
+    return res;
+  }, id);
+  return result;
+}
+
 // ── F1 : Formatage paiements YapsonPress ─────────────────────
 async function runF1() {
   log('▶ F1 — Lecture paiements YapsonPress…');
@@ -367,20 +410,38 @@ async function runF3() {
     if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(2000); }
   } catch(e) { log(`⚠ Setup tableau: ${e.message.substring(0,80)}`); }
 
-  // Extraire toutes les lignes en attente
-  // Structure my-managment Pending deposit requests :
-  // col0=DATE DE CRÉATION (2026-05-02 00:37:13)
-  // col1=INFOS SUR L'UTILISATEUR (texte + numéro ex: "...effectué 0701556950")
-  // col2=MONTANT (3 000)
-  // col3=NOM DE LA BANQUE
-  // col4=PROCESSING TIME
-  // col5=CONFIRMER (lien)
-  // col6=REJETER (lien)
+  // Extraire toutes les lignes en attente avec les données cachées (id, report_id etc.)
   const pendingRows = await page.$$eval('table tbody tr', (trs) => {
     return trs.map(tr => {
       const cells = [...tr.querySelectorAll('td')].map(td => td.innerText.trim());
       const hasConfirm = tr.innerText.includes('Confirmer') || tr.innerText.includes('Confirm');
-      return { cells, hasConfirm };
+
+      // Extraire les data-attributes ou onclick pour récupérer id, report_id, subagent_id, currency
+      // Les liens Confirmer/Rejeter ont souvent ces infos en attributs Vue :data-* ou @click
+      const links = [...tr.querySelectorAll('a')];
+      const confirmLink = links.find(a => a.innerText?.trim() === 'Confirmer');
+      const rejectLink  = links.find(a => a.innerText?.trim() === 'Rejeter');
+
+      // Chercher les attributs data-* sur la ligne ou ses cellules
+      const allEls = [tr, ...tr.querySelectorAll('[data-id],[data-report],[data-subagent],[data-currency],[onclick]')];
+      let rowId = null, reportId = null, subagentId = null, currency = null;
+      for (const el of allEls) {
+        if (el.dataset?.id)       rowId     = el.dataset.id;
+        if (el.dataset?.reportId) reportId  = el.dataset.reportId;
+        if (el.dataset?.subagent) subagentId= el.dataset.subagent;
+        if (el.dataset?.currency) currency  = el.dataset.currency;
+        // Chercher dans les attributs Vue/onclick
+        const onclick = el.getAttribute('onclick') || '';
+        const vClick  = el.getAttribute('@click') || el.getAttribute('v-on:click') || '';
+        const src = onclick + vClick;
+        if (src) {
+          const mId  = src.match(/['"](\d{10,})['"]/);
+          if (mId && !rowId) rowId = mId[1];
+        }
+      }
+
+      return { cells, hasConfirm, rowId, reportId, subagentId, currency,
+               hasConfirmLink: !!confirmLink, hasRejectLink: !!rejectLink };
     }).filter(r => r.hasConfirm && r.cells.length >= 5);
   });
 
@@ -483,27 +544,13 @@ async function runF3() {
       const cells = await rowHandle.$$eval('td', tds => tds.map(td => td.innerText.trim()));
       if (cells.length < 5) continue;
 
-      // Structure confirmée par inspection visuelle :
-      // col0 = DATE DE CRÉATION  ex: "2026-05-02 00:37:13"
-      // col1 = INFOS UTILISATEUR ex: "Votre numéro...effectué 0701556950"
-      // col2 = MONTANT           ex: "3 000"
-      // col3 = NOM DE LA BANQUE  ex: "Orange Money #166059"
-      // col4 = PROCESSING TIME   ex: "less than 1 minute" / "4 minutes"
-      // col5 = CONFIRMER (lien)
-      // col6 = REJETER (lien)
-
       let reqPhone  = null;
       let reqAmount = null;
       let reqDate   = null;
 
-      // col0 → date de création
-      reqDate = parseMgmtDate(cells[0]);
-
-      // col1 → numéro de téléphone (10 chiffres commençant par 0)
+      reqDate   = parseMgmtDate(cells[0]);
       const phoneMatch = cells[1].match(/(0\d{9})/);
       if (phoneMatch) reqPhone = normPhone(phoneMatch[1]);
-
-      // col2 → montant
       reqAmount = parseAmount(cells[2]);
 
       if (!reqPhone) continue;
@@ -537,38 +584,70 @@ async function runF3() {
           } catch(e) { log(`⚠ Saisie montant: ${e.message.substring(0,60)}`); }
         }
 
-        // Cliquer Confirmer via Vue.js (lien <a> texte "Confirmer")
+        // Confirmer via API directe : cliquer → lire ID dans modale → fermer → appeler API
         try {
-          // Trouver l'index de la ligne dans le tableau pour cibler précisément
           const allLinks = await rowHandle.$$('a');
           let confirmBtn = null;
           for (const lnk of allLinks) {
             const txt = await lnk.innerText();
             if (txt.trim() === 'Confirmer') { confirmBtn = lnk; break; }
           }
-          if (confirmBtn) {
-            // Scroll vers l'élément puis clic natif Playwright
-            await confirmBtn.scrollIntoViewIfNeeded();
-            await page.waitForTimeout(300);
-            await confirmBtn.click({ force: true });
-            await page.waitForTimeout(1500);
+          if (!confirmBtn) { log(`F3 ⚠ Bouton Confirmer non trouvé pour ${reqPhone}`); continue; }
 
-            // Popup SweetAlert2
-            try {
-              const popupConfirm = await page.waitForSelector(
-                '.swal2-confirm, .swal2-popup button.btn-success, button.swal2-confirm',
-                { timeout: 5000 }
-              );
-              if (popupConfirm) {
-                await popupConfirm.click({ force: true });
-                await page.waitForTimeout(1000);
-              }
-            } catch {}
+          // Cliquer pour ouvrir la modale et récupérer l'ID
+          await confirmBtn.scrollIntoViewIfNeeded();
+          await page.waitForTimeout(300);
+          await page.evaluate(el => el.click(), confirmBtn);
+          await page.waitForTimeout(1000);
 
+          // Lire l'ID depuis le titre de la modale "Confirm request № 12345678"
+          const modalData = await page.evaluate(() => {
+            const modal = document.querySelector('.modal_wrap');
+            if (!modal) return null;
+            // Lire le texte du titre
+            const titleEl = [...modal.querySelectorAll('*')].find(el =>
+              el.children.length === 0 && (el.innerText?.includes('request') || el.innerText?.includes('Confirm') || el.innerText?.includes('Rejeter'))
+            );
+            const titleText = titleEl?.innerText || '';
+            const idMatch = titleText.match(/№\s*(\d+)/);
+            // Lire le montant dans l'input
+            const inputs = [...modal.querySelectorAll('input')];
+            const amountInput = inputs[0]; // premier input = montant
+            const summaUser = amountInput?.value || '';
+            // Lire subagent_id, report_id, currency depuis les inputs cachés
+            const hiddenInputs = [...modal.querySelectorAll('input[type=hidden]')];
+            const hidden = {};
+            hiddenInputs.forEach(i => { hidden[i.name || i.id] = i.value; });
+            return { id: idMatch?.[1], summaUser, hidden, titleText };
+          });
+
+          if (!modalData?.id) {
+            log(`F3 ⚠ ID non trouvé dans modale pour ${reqPhone} — fermeture`);
+            // Fermer la modale
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(500);
+            continue;
+          }
+
+          // Fermer la modale (Escape) — on va appeler l'API directement
+          await page.keyboard.press('Escape');
+          await page.waitForTimeout(500);
+
+          // Appeler l'API directement avec les cookies de session
+          const confirmResult = await mgmtConfirm({
+            id:         parseInt(modalData.id),
+            summa:      montantCorrigé,        // montant YapsonPress (corrigé)
+            summaUser:  modalData.summaUser || String(reqAmount || montantCorrigé),
+            reportId:   modalData.hidden?.report_id || '',
+            subagentId: modalData.hidden?.subagent_id || '',
+            currency:   modalData.hidden?.currency || '',
+          });
+
+          if (confirmResult?.status === 200 || confirmResult?.status === 201) {
             confirmedCount++;
-            log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(reqAmount || montantYapson)}F`);
+            log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F (id:${modalData.id})`);
           } else {
-            log(`F3 ⚠ Bouton Confirmer non trouvé pour ${reqPhone}`);
+            log(`F3 ⚠ Confirm API ${reqPhone}: status=${confirmResult?.status} resp=${String(confirmResult?.response||'').substring(0,60)}`);
           }
         } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message.substring(0,80)}`); }
 
@@ -577,33 +656,47 @@ async function runF3() {
         if (ageMin >= rejectMin) {
           log(`F3 — Rejet: ${reqPhone} introuvable, âge ${ageMin.toFixed(0)} min >= ${rejectMin} min`);
           try {
+            // Rejeter : cliquer → lire ID → fermer → appeler API directe
             const allLinks2 = await rowHandle.$$('a');
             let rejectBtn = null;
             for (const lnk of allLinks2) {
               const txt = await lnk.innerText();
               if (txt.trim() === 'Rejeter') { rejectBtn = lnk; break; }
             }
-            if (rejectBtn) {
-              await rejectBtn.scrollIntoViewIfNeeded();
-              await page.waitForTimeout(300);
-              await rejectBtn.click({ force: true });
-              await page.waitForTimeout(1500);
+            if (!rejectBtn) { log(`F3 ⚠ Bouton Rejeter non trouvé pour ${reqPhone}`); continue; }
 
-              try {
-                const popupReject = await page.waitForSelector(
-                  '.swal2-confirm, .swal2-popup button.btn-danger, button.swal2-confirm',
-                  { timeout: 5000 }
-                );
-                if (popupReject) {
-                  await popupReject.click({ force: true });
-                  await page.waitForTimeout(1000);
-                }
-              } catch {}
+            await rejectBtn.scrollIntoViewIfNeeded();
+            await page.waitForTimeout(300);
+            await page.evaluate(el => el.click(), rejectBtn);
+            await page.waitForTimeout(1000);
 
+            // Lire l'ID depuis la modale
+            const rejectModalData = await page.evaluate(() => {
+              const modal = document.querySelector('.modal_wrap');
+              if (!modal) return null;
+              const titleEl = [...modal.querySelectorAll('*')].find(el =>
+                el.children.length === 0 && el.innerText?.includes('№')
+              );
+              const idMatch = (titleEl?.innerText || '').match(/№\s*(\d+)/);
+              return { id: idMatch?.[1] };
+            });
+
+            // Fermer la modale
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(500);
+
+            if (!rejectModalData?.id) {
+              log(`F3 ⚠ ID rejet non trouvé pour ${reqPhone}`);
+              continue;
+            }
+
+            // Appeler l'API rejet directement
+            const rejectResult = await mgmtReject(parseInt(rejectModalData.id));
+            if (rejectResult?.status === 200 || rejectResult?.status === 201) {
               rejectedCount++;
-              log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
+              log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min, id:${rejectModalData.id})`);
             } else {
-              log(`F3 ⚠ Bouton Rejeter non trouvé pour ${reqPhone}`);
+              log(`F3 ⚠ Rejet API ${reqPhone}: status=${rejectResult?.status} resp=${String(rejectResult?.response||'').substring(0,60)}`);
             }
           } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message.substring(0,80)}`); }
         } else {
