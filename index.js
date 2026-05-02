@@ -24,8 +24,7 @@ app.use(express.urlencoded({ extended: true }));
 const YAPSON_TOKEN   = process.env.YAPSON_TOKEN   || '';
 const YAPSON_URL     = (process.env.YAPSON_URL    || 'https://sms-mirror-production.up.railway.app').replace(/\/$/, '');
 const MGMT_URL       = (process.env.MGMT_URL      || 'https://my-managment.com').replace(/\/$/, '');
-const MGMT_USER      = process.env.MGMT_USER      || '';
-const MGMT_PASS      = process.env.MGMT_PASS      || '';
+// MGMT_USER/PASS supprimés — connexion par cookies uniquement
 const FONCTION       = (process.env.FONCTION      || 'F1').toUpperCase();
 const SENDERS        = (process.env.SENDERS       || 'Wave Business,+454,MobileMoney,MoovMoney').split(',').map(s => s.trim());
 const INTERVAL_SEC   = parseInt(process.env.INTERVAL_SEC  || '30', 10);
@@ -58,6 +57,8 @@ let state = {
   logs:      [],
   twofa:     false,
   twofaCode: '',
+  cookiesReady: false,
+  cookies:   null,   // JSON string des cookies my-managment
 };
 
 function log(msg, level = 'info') {
@@ -185,44 +186,76 @@ async function ensureBrowser() {
 }
 
 async function mgmtLogin() {
-  log('🔐 Connexion my-managment…');
-  await page.goto(`${MGMT_URL}/fr/login`, { waitUntil: 'networkidle', timeout: 30000 });
-
-  // Remplir identifiants
-  await page.fill('input[name="username"], input[type="text"]', MGMT_USER);
-  await page.fill('input[name="password"], input[type="password"]', MGMT_PASS);
-  await page.click('button[type="submit"], input[type="submit"]');
-  await page.waitForTimeout(2000);
-
-  // Vérifier 2FA
-  const url = page.url();
-  if (url.includes('2fa') || url.includes('otp') || url.includes('code')) {
-    log('📱 2FA requis — en attente du code…');
-    state.twofa   = true;
-    state.status  = 'waiting_2fa';
-    // Attendre jusqu'à 5 minutes que le code soit fourni
-    for (let i = 0; i < 300; i++) {
-      if (state.twofaCode) break;
+  // Connexion par injection de cookies (reCAPTCHA bloque le login auto)
+  if (!state.cookies) {
+    log('🍪 Cookies my-managment requis — en attente via le dashboard…');
+    state.status = 'waiting_cookies';
+    state.cookiesReady = false;
+    // Attendre jusqu'à 30 minutes que les cookies soient fournis
+    for (let i = 0; i < 1800; i++) {
+      if (state.cookies) break;
       await new Promise(r => setTimeout(r, 1000));
     }
-    if (!state.twofaCode) throw new Error('2FA timeout');
-    const code = state.twofaCode;
-    state.twofaCode = '';
-    state.twofa     = false;
-    await page.fill('input[name="code"], input[type="text"], input[placeholder*="code" i]', code);
-    await page.click('button[type="submit"], input[type="submit"]');
-    await page.waitForTimeout(2000);
+    if (!state.cookies) throw new Error('Cookies timeout — non fournis dans les 30 min');
   }
 
-  log('✅ Connecté à my-managment');
-  state.status = 'connected';
+  log('🍪 Injection des cookies my-managment…');
+  await ensureBrowser();
+
+  // Parser les cookies (JSON array)
+  let cookieList;
+  try {
+    cookieList = JSON.parse(state.cookies);
+    if (!Array.isArray(cookieList)) throw new Error('Format invalide');
+  } catch(e) {
+    log(`❌ Cookies invalides: ${e.message}`);
+    state.cookies = null;
+    state.cookiesReady = false;
+    throw new Error('Cookies JSON invalides');
+  }
+
+  // Naviguer sur le domaine d'abord
+  await page.goto(MGMT_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+  // Injecter les cookies
+  const context = page.context();
+  await context.clearCookies();
+  const cleaned = cookieList.map(c => ({
+    name:     c.name,
+    value:    c.value,
+    domain:   c.domain || '.my-managment.com',
+    path:     c.path   || '/',
+    httpOnly: c.httpOnly || false,
+    secure:   c.secure   || false,
+    sameSite: ['Strict','Lax','None'].includes(c.sameSite) ? c.sameSite : 'Lax',
+  }));
+  await context.addCookies(cleaned);
+
+  // Recharger et vérifier
+  await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
+  const currentUrl = page.url();
+  if (currentUrl.includes('login')) {
+    log('❌ Cookies refusés — session expirée, fournir de nouveaux cookies');
+    state.cookies = null;
+    state.cookiesReady = false;
+    state.status = 'waiting_cookies';
+    throw new Error('Cookies refusés par my-managment');
+  }
+
+  log('✅ Connecté à my-managment via cookies');
+  state.cookiesReady = true;
+  state.status = 'running';
 }
 
 async function ensureLoggedIn() {
   await ensureBrowser();
+  if (!state.cookiesReady || !state.cookies) {
+    await mgmtLogin();
+    return;
+  }
   try {
     const url = page.url();
-    if (!url.includes(MGMT_URL) || url.includes('login')) {
+    if (!url || url.includes('login') || url === 'about:blank') {
       await mgmtLogin();
     }
   } catch {
@@ -526,15 +559,35 @@ async function runF3() {
   state.rejected  += rejectedCount;
 }
 
+// ── Contrôle pause / resume ───────────────────────────────────
+let paused = false;
+
+function setPaused(val) {
+  paused = val;
+  if (paused) {
+    state.status = 'paused';
+    log("⏸ Bot mis en pause par l'utilisateur");
+  } else {
+    state.status = state.cookiesReady ? 'running' : 'waiting_cookies';
+    log("▶ Bot relancé par l'utilisateur");
+  }
+}
+
 // ── Boucle principale ─────────────────────────────────────────
 async function mainLoop() {
   log(`🤖 Bot démarré — Fonction: ${FONCTION} | Intervalle: ${INTERVAL_SEC}s`);
   if (FONCTION === 'F3') {
-    log(`⚙ F3 config: marge=${F3_MARGIN_MIN}min | seuil rejet=${F3_REJECT_MIN}min`);
+    log(`⚙ F3 config: marge=${f3Config.marginMin}min | seuil rejet=${f3Config.rejectMin}min`);
   }
-  state.status = 'running';
+  state.status = state.cookies ? 'running' : 'waiting_cookies';
 
   while (true) {
+    // Si en pause, attendre sans rien faire
+    if (paused) {
+      await new Promise(r => setTimeout(r, 2000));
+      continue;
+    }
+
     try {
       state.polls++;
       state.lastRun = new Date().toISOString();
@@ -551,9 +604,13 @@ async function mainLoop() {
     } catch(e) {
       state.errors++;
       log(`❌ Erreur cycle: ${e.message}`);
-      state.status = 'error';
-      // Tenter reconnexion
-      try { await mgmtLogin(); state.status = 'running'; } catch {}
+      if (!paused) state.status = 'error';
+      // Si erreur de cookies → attendre nouveaux cookies
+      if (e.message.includes('ookies')) {
+        log('🍪 En attente de nouveaux cookies…');
+      } else {
+        await new Promise(r => setTimeout(r, 5000));
+      }
     }
 
     await new Promise(r => setTimeout(r, INTERVAL_SEC * 1000));
@@ -589,6 +646,12 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   input{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:8px 12px;font-size:13px;width:200px}
   button{background:#89b4fa;color:#1e1e2e;border:none;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:bold;cursor:pointer;margin-left:8px}
   .badge{display:inline-block;background:#313244;border-radius:6px;padding:2px 8px;font-size:11px;margin:2px}
+  .status.paused{background:#fab387;color:#1e1e2e}
+  .status.waiting_cookies{background:#f38ba8;color:#1e1e2e;animation:pulse 1s infinite}
+  .status.connected{background:#a6e3a1;color:#1e1e2e}
+  .btn-stop{background:#f38ba8;color:#1e1e2e;border:none;border-radius:8px;padding:8px 20px;font-size:13px;font-weight:bold;cursor:pointer;margin-right:8px}
+  .btn-start{background:#a6e3a1;color:#1e1e2e;border:none;border-radius:8px;padding:8px 20px;font-size:13px;font-weight:bold;cursor:pointer;margin-right:8px}
+  .btn-neutral{background:#89b4fa;color:#1e1e2e;border:none;border-radius:8px;padding:8px 20px;font-size:13px;font-weight:bold;cursor:pointer}
 </style>
 </head>
 <body>
@@ -598,7 +661,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <span class="badge">Polls: {{POLLS}}</span>
 <span class="badge">Dernière exécution: {{LAST_RUN}}</span>
 
-{{TWOFA_FORM}}
+{{CONTROL_BUTTONS}}
+
+{{COOKIES_FORM}}
 
 {{F3_CONFIG_FORM}}
 
@@ -635,12 +700,36 @@ app.get('/', (req, res) => {
     connected:   '🟢 Connecté',
   };
 
-  const twoFaForm = state.twofa ? `
-<form method="POST" action="/2fa" style="background:#1e1e2e;border-radius:10px;padding:16px;margin-bottom:16px">
-  <div style="color:#fab387;font-size:13px;font-weight:bold;margin-bottom:10px">📱 Code 2FA requis</div>
-  <input name="code" type="text" maxlength="6" placeholder="6 chiffres" autofocus style="background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:8px 12px;font-size:13px;width:160px">
-  <button type="submit" style="background:#89b4fa;color:#1e1e2e;border:none;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:bold;cursor:pointer;margin-left:8px">Valider</button>
+  // Boutons Stop / Start
+  const isPaused = paused;
+  const controlButtons = `
+<div style="margin-bottom:16px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+  ${isPaused
+    ? '<form method="POST" action="/control" style="display:inline"><input type="hidden" name="action" value="start"><button class="btn-start" type="submit">▶ Relancer</button></form>'
+    : '<form method="POST" action="/control" style="display:inline"><input type="hidden" name="action" value="stop"><button class="btn-stop" type="submit">⏸ Arrêter</button></form>'
+  }
+  <form method="POST" action="/control" style="display:inline">
+    <input type="hidden" name="action" value="reset_cookies">
+    <button class="btn-neutral" type="submit" title="Forcer la re-injection des cookies">🍪 Réinitialiser cookies</button>
+  </form>
+  <span style="font-size:11px;color:#6c7086">Cookies: ${state.cookiesReady ? '✅ Actifs' : '❌ Non fournis'}</span>
+</div>`;
+
+  // Formulaire cookies (si pas de cookies ou reset demandé)
+  const cookiesForm = !state.cookiesReady ? `
+<form method="POST" action="/cookies" style="background:#1e1e2e;border-radius:10px;padding:16px;margin-bottom:16px">
+  <div style="color:#f38ba8;font-size:13px;font-weight:bold;margin-bottom:8px">🍪 Cookies my-managment requis</div>
+  <div style="font-size:11px;color:#6c7086;margin-bottom:10px">
+    1. Connecte-toi sur my-managment.com dans ton navigateur<br>
+    2. F12 → Application → Cookies → my-managment.com<br>
+    3. Copie tout en JSON (extension EditThisCookie) et colle ci-dessous
+  </div>
+  <textarea name="cookies" rows="4" placeholder='[{"name":"session","value":"...","domain":".my-managment.com",...}]'
+    style="width:100%;background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:8px;font-size:11px;font-family:monospace;resize:vertical"></textarea>
+  <button type="submit" style="margin-top:8px;background:#a6e3a1;color:#1e1e2e;border:none;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:bold;cursor:pointer">🍪 Injecter les cookies</button>
 </form>` : '';
+
+  const twoFaForm = ''; // supprimé — login par cookies uniquement
 
   // Formulaire de configuration F3 (visible uniquement si FONCTION=F3)
   const f3ConfigForm = (FONCTION === 'F3') ? `
@@ -662,19 +751,26 @@ app.get('/', (req, res) => {
   <span style="font-size:11px;color:#6c7086">Actuel : marge=${f3Config.marginMin}min | rejet>=${f3Config.rejectMin}min</span>
 </form>` : '';
 
+  const statusLabelsExtra = Object.assign({
+    paused:          '⏸ En pause',
+    waiting_cookies: '🍪 Cookies requis',
+  }, statusLabels);
+
   const html = DASHBOARD_HTML
-    .replace('{{STATUS_CLASS}}',   state.status)
-    .replace('{{STATUS_LABEL}}',   statusLabels[state.status] || state.status)
-    .replace('{{FONCTION}}',       state.fonction)
-    .replace('{{POLLS}}',          state.polls)
-    .replace('{{LAST_RUN}}',       state.lastRun ? new Date(state.lastRun).toLocaleTimeString('fr-FR') : '—')
-    .replace('{{TWOFA_FORM}}',     twoFaForm)
-    .replace('{{F3_CONFIG_FORM}}', f3ConfigForm)
-    .replace('{{CONFIRMED}}',      state.confirmed)
-    .replace('{{APPROVED}}',       state.approved)
-    .replace('{{REJECTED}}',       state.rejected)
-    .replace('{{ERRORS}}',         state.errors)
-    .replace('{{LOGS}}',           state.logs.slice(0, 60).map(l => `<div>${l}</div>`).join(''));
+    .replace('{{STATUS_CLASS}}',     state.status)
+    .replace('{{STATUS_LABEL}}',     statusLabelsExtra[state.status] || state.status)
+    .replace('{{FONCTION}}',         state.fonction)
+    .replace('{{POLLS}}',            state.polls)
+    .replace('{{LAST_RUN}}',         state.lastRun ? new Date(state.lastRun).toLocaleTimeString('fr-FR') : '—')
+    .replace('{{CONTROL_BUTTONS}}',  controlButtons)
+    .replace('{{COOKIES_FORM}}',     cookiesForm)
+    .replace('{{TWOFA_FORM}}',       twoFaForm)
+    .replace('{{F3_CONFIG_FORM}}',   f3ConfigForm)
+    .replace('{{CONFIRMED}}',        state.confirmed)
+    .replace('{{APPROVED}}',         state.approved)
+    .replace('{{REJECTED}}',         state.rejected)
+    .replace('{{ERRORS}}',           state.errors)
+    .replace('{{LOGS}}',             state.logs.slice(0, 60).map(l => `<div>${l}</div>`).join(''));
 
   res.send(html);
 });
@@ -684,6 +780,41 @@ app.post('/2fa', (req, res) => {
   if (code.length >= 4) {
     state.twofaCode = code;
     log(`📱 Code 2FA reçu: ${code}`);
+  }
+  res.redirect('/');
+});
+
+app.post('/control', (req, res) => {
+  const action = req.body.action || '';
+  if (action === 'stop') {
+    setPaused(true);
+    log('⏸ Arrêt demandé depuis le dashboard');
+  } else if (action === 'start') {
+    setPaused(false);
+    log('▶ Relance demandée depuis le dashboard');
+  } else if (action === 'reset_cookies') {
+    state.cookies = null;
+    state.cookiesReady = false;
+    state.status = 'waiting_cookies';
+    log('🍪 Cookies réinitialisés — en attente de nouveaux cookies');
+  }
+  res.redirect('/');
+});
+
+app.post('/cookies', (req, res) => {
+  const raw = (req.body.cookies || '').trim();
+  if (!raw) { res.redirect('/'); return; }
+  // Valider que c'est du JSON valide
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error('Doit être un tableau JSON');
+    state.cookies = raw;
+    state.cookiesReady = false; // sera mis à true après injection réussie
+    log(`🍪 ${parsed.length} cookie(s) reçu(s) — injection en cours…`);
+    // Déclencher le login immédiatement en background
+    mgmtLogin().catch(e => log(`❌ Injection cookies: ${e.message}`));
+  } catch(e) {
+    log(`❌ JSON cookies invalide: ${e.message}`);
   }
   res.redirect('/');
 });
