@@ -586,34 +586,49 @@ async function runF3() {
           } catch(e) { log(`⚠ Saisie montant: ${e.message.substring(0,60)}`); }
         }
 
-        // Confirmer : vrai clic Playwright natif → modale → CONFIRMER
+        // Confirmer — logique exacte bot6 : chercher ligne, cliquer, attendre bouton CONFIRMER
         try {
-          // Trouver le lien Confirmer de cette ligne via locator dans le handle
-          const confirmLocator = rowHandle.locator('a', { hasText: 'Confirmer' });
-          const confirmCount = await confirmLocator.count();
-          if (!confirmCount) { log(`F3 ⚠ Lien Confirmer non trouvé pour ${reqPhone}`); continue; }
+          // Trouver le lien Confirmer dans la ligne
+          let confirmLink = null;
+          for (const a of await rowHandle.$$('a')) {
+            if ((await a.textContent()).trim() === 'Confirmer') { confirmLink = a; break; }
+          }
+          if (!confirmLink) { log(`F3 ⚠ Lien Confirmer non trouvé pour ${reqPhone}`); continue; }
 
-          await confirmLocator.first().scrollIntoViewIfNeeded();
-          await page.waitForTimeout(200);
-          await confirmLocator.first().click();  // vrai clic Playwright natif
+          await confirmLink.click();
+          await page.waitForTimeout(800);
 
-          // Attendre la modale
-          await page.waitForSelector('.modal_wrap', { timeout: 8000 });
-          await page.waitForTimeout(600);
-
-          // Modifier le montant si nécessaire
-          if (montantCorrigé && montantCorrigé !== reqAmount) {
-            try {
-              const amountInput = page.locator('.modal_wrap input').first();
-              await amountInput.clear();
-              await amountInput.fill(String(montantCorrigé));
-              await page.waitForTimeout(200);
-            } catch(e) { /* ignore */ }
+          // Chercher le bouton CONFIRMER dans la modale (boucle comme bot6)
+          let modalBtn = null;
+          for (let i = 0; i < 30; i++) {
+            for (const b of await page.$$('button')) {
+              const t = (await b.textContent()).trim().toUpperCase();
+              const box = await b.boundingBox();
+              if (t === 'CONFIRMER' && box && box.width > 100) { modalBtn = b; break; }
+            }
+            if (modalBtn) break;
+            await page.waitForTimeout(300);
           }
 
-          // Cliquer CONFIRMER dans la modale (premier bouton = teal)
-          await page.locator('.modal_wrap button').first().click();
-          await page.waitForTimeout(1500);
+          if (!modalBtn) { log(`F3 ⚠ Modale CONFIRMER non trouvée pour ${reqPhone}`); continue; }
+
+          // Corriger le montant si nécessaire
+          if (montantCorrigé && montantCorrigé !== reqAmount) {
+            const mi = await page.$('input[placeholder="Montant"],input[placeholder="montant"]');
+            if (mi) { await mi.fill(''); await mi.fill(String(montantCorrigé)); await page.waitForTimeout(200); }
+            const ci = await page.$('input[placeholder="Commentaire"],textarea[placeholder="Commentaire"]');
+            if (ci) { await ci.fill(''); await ci.fill(String(montantCorrigé)); await page.waitForTimeout(200); }
+          }
+
+          await modalBtn.click();
+          // Attendre que la modale disparaisse
+          for (let i = 0; i < 30; i++) {
+            let found = false;
+            for (const b of await page.$$('button')) if ((await b.textContent()).trim().toUpperCase() === 'CONFIRMER') { found = true; break; }
+            if (!found) break;
+            await page.waitForTimeout(300);
+          }
+          await page.waitForTimeout(1000);
           confirmedCount++;
           log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F`);
         } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message.substring(0,80)}`); }
@@ -623,22 +638,35 @@ async function runF3() {
         if (ageMin >= rejectMin) {
           log(`F3 — Rejet: ${reqPhone} introuvable, âge ${ageMin.toFixed(0)} min >= ${rejectMin} min`);
           try {
-            // Rejeter : vrai clic Playwright natif → modale → OK
-            const rejectLocator = rowHandle.locator('a', { hasText: 'Rejeter' });
-            const rejectCount = await rejectLocator.count();
-            if (!rejectCount) { log(`F3 ⚠ Lien Rejeter non trouvé pour ${reqPhone}`); continue; }
+            // Rejeter — logique exacte bot6 : cliquer Rejeter, attendre OK
+            let rejectLink = null;
+            for (const a of await rowHandle.$$('a')) {
+              if ((await a.textContent()).trim() === 'Rejeter') { rejectLink = a; break; }
+            }
+            if (!rejectLink) { log(`F3 ⚠ Lien Rejeter non trouvé pour ${reqPhone}`); continue; }
 
-            await rejectLocator.first().scrollIntoViewIfNeeded();
-            await page.waitForTimeout(200);
-            await rejectLocator.first().click();  // vrai clic Playwright natif
+            await rejectLink.click();
 
-            // Attendre la modale
-            await page.waitForSelector('.modal_wrap', { timeout: 8000 });
-            await page.waitForTimeout(600);
+            // Chercher le bouton OK (boucle comme bot6)
+            let okBtn = null;
+            for (let i = 0; i < 40; i++) {
+              for (const b of await page.$$('button, a.btn, .btn')) {
+                if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { okBtn = b; break; }
+              }
+              if (okBtn) break;
+              await page.waitForTimeout(200);
+            }
 
-            // Cliquer OK (premier bouton de la modale rejet)
-            await page.locator('.modal_wrap button').first().click();
-            await page.waitForTimeout(1500);
+            if (!okBtn) { log(`F3 ⚠ Bouton OK rejet non trouvé pour ${reqPhone}`); continue; }
+
+            await page.waitForTimeout(300);
+            const ci = await page.$('input[placeholder="Commentaire"],textarea[placeholder="Commentaire"]');
+            if (ci) { await ci.fill('Expiré'); await page.waitForTimeout(200); }
+
+            for (const b of await page.$$('button, a.btn, .btn')) {
+              if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { await b.click(); break; }
+            }
+            await page.waitForTimeout(2000);
             rejectedCount++;
             log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
           } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message.substring(0,80)}`); }
