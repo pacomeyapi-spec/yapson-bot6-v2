@@ -590,7 +590,7 @@ async function runF3() {
         try {
           // Trouver le lien Confirmer dans la ligne
           let confirmLink = null;
-          for (const a of await rowHandle.$$('a')) {
+          for (const a of await rowHandle.locator('a').all()) {
             if ((await a.textContent()).trim() === 'Confirmer') { confirmLink = a; break; }
           }
           if (!confirmLink) { log(`F3 ⚠ Lien Confirmer non trouvé pour ${reqPhone}`); continue; }
@@ -640,7 +640,7 @@ async function runF3() {
           try {
             // Rejeter — logique exacte bot6 : cliquer Rejeter, attendre OK
             let rejectLink = null;
-            for (const a of await rowHandle.$$('a')) {
+            for (const a of await rowHandle.locator('a').all()) {
               if ((await a.textContent()).trim() === 'Rejeter') { rejectLink = a; break; }
             }
             if (!rejectLink) { log(`F3 ⚠ Lien Rejeter non trouvé pour ${reqPhone}`); continue; }
