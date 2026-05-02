@@ -536,12 +536,14 @@ async function runF3() {
   let confirmedCount = 0;
   let rejectedCount  = 0;
 
-  // Re-lire les lignes (la page peut avoir changé)
-  const rowHandles = await page.$$('table tbody tr');
+  // Re-lire les lignes avec Locators (nécessaire pour .locator() sur les enfants)
+  const rowLocators = page.locator('table tbody tr');
+  const rowCount = await rowLocators.count();
 
-  for (const rowHandle of rowHandles) {
+  for (let ri = 0; ri < rowCount; ri++) {
+    const rowHandle = rowLocators.nth(ri);
     try {
-      const cells = await rowHandle.$$eval('td', tds => tds.map(td => td.innerText.trim()));
+      const cells = await rowHandle.locator('td').allInnerTexts();
       if (cells.length < 5) continue;
 
       let reqPhone  = null;
