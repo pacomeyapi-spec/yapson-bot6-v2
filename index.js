@@ -119,24 +119,25 @@ function parseMsg(sender, content) {
     if (m) return { phone: m[1], amount: parseAmount(m[2]) };
   }
   if (sender === '+454' || sender.includes('MobileMoney') || sender.includes('Orange')) {
-    const m = content.match(/(\d[\d\s\u00a0]+)\s*F.*?(0\d{9})/i)
-           || content.match(/(0\d{9}).*?(\d[\d\s\u00a0]+)\s*F/i);
-    if (m) {
-      const phone  = normPhone(m[1].replace(/[^\d]/g,'').length === 10 ? m[1] : m[2]);
-      const amtStr = m[1].replace(/[^\d]/g,'').length <= 6 ? m[2] : m[1];
-      return { phone, amount: parseAmount(amtStr) };
-    }
+    // Format Orange Money: "transfert de 500.00 FCFA du 0758006523"
+    // ou: "transfert de 1 000.00 FCFA du 0708043759"
+    const m1 = content.match(/transfert de ([\d\s .,]+)\s*FCFA\s+du\s+(0\d{9})/i);
+    if (m1) return { phone: normPhone(m1[2]), amount: parseAmount(m1[1]) };
+    // Format alternatif: montant puis numéro
+    const m2 = content.match(/([\d\s .,]+)\s*FCFA.*?(0\d{9})/i);
+    if (m2) return { phone: normPhone(m2[2]), amount: parseAmount(m2[1]) };
+    // Format: numéro puis montant
+    const m3 = content.match(/(0\d{9}).*?([\d\s .,]+)\s*FCFA/i);
+    if (m3) return { phone: normPhone(m3[1]), amount: parseAmount(m3[2]) };
   }
   if (sender.includes('MoovMoney')) {
-    const m = content.match(/(0\d{9}).*?(\d[\d\s\u00a0]+)\s*FCFA/i)
-           || content.match(/(\d[\d\s\u00a0]+)\s*FCFA.*?(0\d{9})/i);
-    if (m) {
-      const digits1 = m[1].replace(/[^\d]/g,'');
-      const digits2 = m[2].replace(/[^\d]/g,'');
-      const phone  = digits1.length === 10 ? m[1].replace(/[^\d]/g,'') : digits2;
-      const amtStr = digits1.length <= 7    ? m[1] : m[2];
-      return { phone: normPhone(phone), amount: parseAmount(amtStr) };
-    }
+    // Format MoovMoney: "transfert de 5000 FCFA du 0787043223" ou similaire
+    const m1 = content.match(/de\s+([\d\s .,]+)\s*FCFA\s+du\s+(0\d{9})/i);
+    if (m1) return { phone: normPhone(m1[2]), amount: parseAmount(m1[1]) };
+    const m2 = content.match(/(0\d{9}).*?([\d\s .,]+)\s*FCFA/i);
+    if (m2) return { phone: normPhone(m2[1]), amount: parseAmount(m2[2]) };
+    const m3 = content.match(/([\d\s .,]+)\s*FCFA.*?(0\d{9})/i);
+    if (m3) return { phone: normPhone(m3[2]), amount: parseAmount(m3[1]) };
   }
   // Pattern générique : numéro 10 chiffres + montant
   const gen = content.match(/(0\d{9}).*?(\d[\d\s\u00a0]{2,})/);
@@ -154,21 +155,26 @@ async function yapsonFetchMessages(fromTs, toTs) {
   });
   if (!res.ok) throw new Error(`YapsonPress API ${res.status}`);
   const data = await res.json();
-  const messages = data.messages || data.data || data || [];
+  // L'API retourne un tableau direct (index 0,1,2...) ou data.messages
+  const messages = Array.isArray(data) ? data : (data.messages || data.data || Object.values(data));
 
   return messages.filter(msg => {
     if (!SENDERS.some(s => (msg.sender || '').includes(s))) return false;
-    const ts = new Date(msg.created_at || msg.date || msg.timestamp).getTime();
-    if (isNaN(ts)) return false;
+    // timestamp est en millisecondes (ex: 1777683351000)
+    let ts = msg.timestamp;
+    if (!ts) ts = new Date(msg.created_at || msg.date || '').getTime();
+    if (!ts || isNaN(ts)) return false;
     return ts >= fromTs && ts <= toTs;
   });
 }
 
 async function yapsonApprove(msgId) {
   const token = YAPSON_TOKEN || state.yapsonToken;
-  const res = await fetch(`${YAPSON_URL}/api/messages/${msgId}/approve`, {
-    method: 'POST',
+  // Route réelle: PATCH /api/messages/{id}/status avec body {"status":"approuve"}
+  const res = await fetch(`${YAPSON_URL}/api/messages/${msgId}/status`, {
+    method: 'PATCH',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'approuve' }),
   });
   return res.ok;
 }
@@ -418,13 +424,13 @@ async function runF3() {
   // Parser les paiements
   const payments = []; // { phone, amount, msgId, approved }
   for (const msg of yapMessages) {
-    const parsed = parseMsg(msg.sender || '', msg.body || msg.content || msg.message || '');
+    const parsed = parseMsg(msg.sender || '', msg.content || msg.body || msg.message || '');
     if (!parsed) continue;
     payments.push({
       phone:    parsed.phone,
       amount:   parsed.amount,
       msgId:    msg.id || msg._id,
-      approved: !!(msg.status === 'approved' || msg.approved || msg.is_approved),
+      approved: msg.status === 'approuve' || msg.status === 'approved',
       sender:   msg.sender,
     });
   }
