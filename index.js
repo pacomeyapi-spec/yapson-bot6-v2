@@ -78,7 +78,15 @@ function normPhone(s) {
 }
 
 function parseAmount(s) {
-  return parseInt(s.replace(/[\s\u00a0.,]/g, '').replace(/[^\d]/g, ''), 10) || 0;
+  if (!s) return 0;
+  const str = String(s).trim();
+  // Extraire la partie numérique avant les lettres (ex: "8000.00 FCFA" → "8000.00")
+  const numPart = str.match(/^[\d\s\u00a0.,]+/)?.[0] || str;
+  // Supprimer espaces/nbsp (séparateurs milliers)
+  const noSpaces = numPart.replace(/[\s\u00a0]/g, '');
+  // Supprimer décimales (point/virgule + 1-2 chiffres en fin) : "8000.00" → "8000"
+  const noDecimal = noSpaces.replace(/[.,]\d{1,2}$/, '');
+  return parseInt(noDecimal.replace(/[^\d]/g, ''), 10) || 0;
 }
 
 function fmtAmt(n) {
@@ -505,54 +513,60 @@ async function runF3() {
       const matches = yapMap[reqPhone];
 
       if (matches && matches.length > 0) {
-        // Trouver le match le plus proche en montant
-        const best = matches.reduce((a, b) =>
+        // Chercher le SMS dont le montant correspond EXACTEMENT à reqAmount
+        // Sinon prendre le plus proche (même numéro, montant le plus proche)
+        const exactMatch = matches.find(p => p.amount === reqAmount);
+        const best = exactMatch || matches.reduce((a, b) =>
           Math.abs(a.amount - (reqAmount||0)) <= Math.abs(b.amount - (reqAmount||0)) ? a : b
         );
 
-        // Vérifier si montant correspond ou doit être corrigé
-        const montantCorrigé = best.amount;
-        const doitCorrigerMontant = reqAmount && reqAmount !== montantCorrigé;
+        // YapsonPress fait référence — son montant (sans décimales) est le bon
+        const montantYapson = best.amount;
+        const montantCorrigé = montantYapson; // toujours YapsonPress
 
-        if (doitCorrigerMontant) {
-          log(`F3 — Correction montant ${reqPhone}: ${fmtAmt(reqAmount)}F → ${fmtAmt(montantCorrigé)}F`);
-          // Chercher le champ montant dans la ligne et le corriger
+        if (reqAmount && reqAmount !== montantCorrigé) {
+          log(`F3 — Correction montant ${reqPhone}: my-managment=${fmtAmt(reqAmount)}F → YapsonPress=${fmtAmt(montantCorrigé)}F`);
+          // Corriger le champ montant dans my-managment si différent
           try {
-            const amountInput = await rowHandle.$('input[type="number"], input[name*="amount"], input[name*="montant"]');
+            const amountInput = await rowHandle.$('input[type="number"], input[name*="amount"], input[name*="montant"], input[name*="Amount"]');
             if (amountInput) {
-              await amountInput.fill('');
-              await amountInput.type(String(montantCorrigé));
+              await amountInput.triple_click();
+              await amountInput.fill(String(montantCorrigé));
+              await page.waitForTimeout(300);
             }
-          } catch(e) { log(`⚠ Correction montant: ${e.message}`); }
+          } catch(e) { log(`⚠ Saisie montant: ${e.message.substring(0,60)}`); }
         }
 
-        // Cliquer Confirmer (liens <a> avec texte exact)
+        // Cliquer Confirmer via Vue.js (lien <a> texte "Confirmer")
         try {
-          const confirmLink = await rowHandle.$('a');
-          let confirmBtn = null;
-          // Chercher le lien "Confirmer" parmi tous les liens de la ligne
+          // Trouver l'index de la ligne dans le tableau pour cibler précisément
           const allLinks = await rowHandle.$$('a');
+          let confirmBtn = null;
           for (const lnk of allLinks) {
             const txt = await lnk.innerText();
             if (txt.trim() === 'Confirmer') { confirmBtn = lnk; break; }
           }
           if (confirmBtn) {
-            // Utiliser dispatchEvent pour contourner les overlays Vue.js
-            await confirmBtn.dispatchEvent('click');
-            await page.waitForTimeout(1200);
+            // Scroll vers l'élément puis clic natif Playwright
+            await confirmBtn.scrollIntoViewIfNeeded();
+            await page.waitForTimeout(300);
+            await confirmBtn.click({ force: true });
+            await page.waitForTimeout(1500);
 
-            // Popup de confirmation SweetAlert / modale
+            // Popup SweetAlert2
             try {
-              const popupBtn = await page.waitForSelector(
-                '.swal2-confirm, button.btn-success, button:has-text("OUI"), button:has-text("Confirmer"), button:has-text("OK")',
-                { timeout: 4000 }
+              const popupConfirm = await page.waitForSelector(
+                '.swal2-confirm, .swal2-popup button.btn-success, button.swal2-confirm',
+                { timeout: 5000 }
               );
-              if (popupBtn) { await popupBtn.dispatchEvent('click'); }
-              await page.waitForTimeout(800);
+              if (popupConfirm) {
+                await popupConfirm.click({ force: true });
+                await page.waitForTimeout(1000);
+              }
             } catch {}
 
             confirmedCount++;
-            log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F`);
+            log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(reqAmount || montantYapson)}F`);
           } else {
             log(`F3 ⚠ Bouton Confirmer non trouvé pour ${reqPhone}`);
           }
@@ -563,7 +577,6 @@ async function runF3() {
         if (ageMin >= rejectMin) {
           log(`F3 — Rejet: ${reqPhone} introuvable, âge ${ageMin.toFixed(0)} min >= ${rejectMin} min`);
           try {
-            // Chercher le lien "Rejeter" parmi tous les liens de la ligne
             const allLinks2 = await rowHandle.$$('a');
             let rejectBtn = null;
             for (const lnk of allLinks2) {
@@ -571,16 +584,20 @@ async function runF3() {
               if (txt.trim() === 'Rejeter') { rejectBtn = lnk; break; }
             }
             if (rejectBtn) {
-              await rejectBtn.dispatchEvent('click');
-              await page.waitForTimeout(1200);
+              await rejectBtn.scrollIntoViewIfNeeded();
+              await page.waitForTimeout(300);
+              await rejectBtn.click({ force: true });
+              await page.waitForTimeout(1500);
 
               try {
-                const popupBtn = await page.waitForSelector(
-                  '.swal2-confirm, button.btn-danger, button:has-text("OUI"), button:has-text("Rejeter"), button:has-text("OK")',
-                  { timeout: 4000 }
+                const popupReject = await page.waitForSelector(
+                  '.swal2-confirm, .swal2-popup button.btn-danger, button.swal2-confirm',
+                  { timeout: 5000 }
                 );
-                if (popupBtn) { await popupBtn.dispatchEvent('click'); }
-                await page.waitForTimeout(800);
+                if (popupReject) {
+                  await popupReject.click({ force: true });
+                  await page.waitForTimeout(1000);
+                }
               } catch {}
 
               rejectedCount++;
