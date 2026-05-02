@@ -584,7 +584,7 @@ async function runF3() {
           } catch(e) { log(`⚠ Saisie montant: ${e.message.substring(0,60)}`); }
         }
 
-        // Confirmer via API directe : cliquer → lire ID dans modale → fermer → appeler API
+        // Confirmer : clic sur lien → modale s'ouvre → modifier montant → clic CONFIRMER
         try {
           const allLinks = await rowHandle.$$('a');
           let confirmBtn = null;
@@ -594,60 +594,37 @@ async function runF3() {
           }
           if (!confirmBtn) { log(`F3 ⚠ Bouton Confirmer non trouvé pour ${reqPhone}`); continue; }
 
-          // Cliquer pour ouvrir la modale et récupérer l'ID
           await confirmBtn.scrollIntoViewIfNeeded();
           await page.waitForTimeout(300);
           await page.evaluate(el => el.click(), confirmBtn);
-          await page.waitForTimeout(1000);
 
-          // Lire l'ID depuis le titre de la modale "Confirm request № 12345678"
-          const modalData = await page.evaluate(() => {
-            const modal = document.querySelector('.modal_wrap');
-            if (!modal) return null;
-            // Lire le texte du titre
-            const titleEl = [...modal.querySelectorAll('*')].find(el =>
-              el.children.length === 0 && (el.innerText?.includes('request') || el.innerText?.includes('Confirm') || el.innerText?.includes('Rejeter'))
-            );
-            const titleText = titleEl?.innerText || '';
-            const idMatch = titleText.match(/№\s*(\d+)/);
-            // Lire le montant dans l'input
-            const inputs = [...modal.querySelectorAll('input')];
-            const amountInput = inputs[0]; // premier input = montant
-            const summaUser = amountInput?.value || '';
-            // Lire subagent_id, report_id, currency depuis les inputs cachés
-            const hiddenInputs = [...modal.querySelectorAll('input[type=hidden]')];
-            const hidden = {};
-            hiddenInputs.forEach(i => { hidden[i.name || i.id] = i.value; });
-            return { id: idMatch?.[1], summaUser, hidden, titleText };
-          });
-
-          if (!modalData?.id) {
-            log(`F3 ⚠ ID non trouvé dans modale pour ${reqPhone} — fermeture`);
-            // Fermer la modale
-            await page.keyboard.press('Escape');
-            await page.waitForTimeout(500);
-            continue;
-          }
-
-          // Fermer la modale (Escape) — on va appeler l'API directement
-          await page.keyboard.press('Escape');
+          // Attendre la modale .modal_wrap
+          await page.waitForSelector('.modal_wrap', { timeout: 5000, state: 'visible' });
           await page.waitForTimeout(500);
 
-          // Appeler l'API directement avec les cookies de session
-          const confirmResult = await mgmtConfirm({
-            id:         parseInt(modalData.id),
-            summa:      montantCorrigé,        // montant YapsonPress (corrigé)
-            summaUser:  modalData.summaUser || String(reqAmount || montantCorrigé),
-            reportId:   modalData.hidden?.report_id || '',
-            subagentId: modalData.hidden?.subagent_id || '',
-            currency:   modalData.hidden?.currency || '',
-          });
+          // Si montant à corriger : modifier le champ input dans la modale
+          if (montantCorrigé && montantCorrigé !== reqAmount) {
+            try {
+              const amountInput = await page.$('.modal_wrap input:not([type=hidden])');
+              if (amountInput) {
+                await amountInput.triple_click();
+                await amountInput.fill(String(montantCorrigé));
+                await page.waitForTimeout(200);
+              }
+            } catch(e) { log(`⚠ Saisie montant modale: ${e.message.substring(0,50)}`); }
+          }
 
-          if (confirmResult?.status === 200 || confirmResult?.status === 201) {
+          // Cliquer le bouton CONFIRMER dans la modale (texte exact)
+          const modalConfirmBtn = await page.$('.modal_wrap button');
+          if (modalConfirmBtn) {
+            await page.evaluate(el => el.click(), modalConfirmBtn);
+            await page.waitForTimeout(1500);
             confirmedCount++;
-            log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F (id:${modalData.id})`);
+            log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F`);
           } else {
-            log(`F3 ⚠ Confirm API ${reqPhone}: status=${confirmResult?.status} resp=${String(confirmResult?.response||'').substring(0,60)}`);
+            log(`F3 ⚠ Bouton CONFIRMER dans modale non trouvé pour ${reqPhone}`);
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(300);
           }
         } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message.substring(0,80)}`); }
 
@@ -656,7 +633,7 @@ async function runF3() {
         if (ageMin >= rejectMin) {
           log(`F3 — Rejet: ${reqPhone} introuvable, âge ${ageMin.toFixed(0)} min >= ${rejectMin} min`);
           try {
-            // Rejeter : cliquer → lire ID → fermer → appeler API directe
+            // Rejeter : clic sur lien → modale s'ouvre → clic OK
             const allLinks2 = await rowHandle.$$('a');
             let rejectBtn = null;
             for (const lnk of allLinks2) {
@@ -668,35 +645,22 @@ async function runF3() {
             await rejectBtn.scrollIntoViewIfNeeded();
             await page.waitForTimeout(300);
             await page.evaluate(el => el.click(), rejectBtn);
-            await page.waitForTimeout(1000);
 
-            // Lire l'ID depuis la modale
-            const rejectModalData = await page.evaluate(() => {
-              const modal = document.querySelector('.modal_wrap');
-              if (!modal) return null;
-              const titleEl = [...modal.querySelectorAll('*')].find(el =>
-                el.children.length === 0 && el.innerText?.includes('№')
-              );
-              const idMatch = (titleEl?.innerText || '').match(/№\s*(\d+)/);
-              return { id: idMatch?.[1] };
-            });
-
-            // Fermer la modale
-            await page.keyboard.press('Escape');
+            // Attendre la modale
+            await page.waitForSelector('.modal_wrap', { timeout: 5000, state: 'visible' });
             await page.waitForTimeout(500);
 
-            if (!rejectModalData?.id) {
-              log(`F3 ⚠ ID rejet non trouvé pour ${reqPhone}`);
-              continue;
-            }
-
-            // Appeler l'API rejet directement
-            const rejectResult = await mgmtReject(parseInt(rejectModalData.id));
-            if (rejectResult?.status === 200 || rejectResult?.status === 201) {
+            // Cliquer le premier bouton dans la modale (OK / CONFIRMER)
+            const modalRejectBtn = await page.$('.modal_wrap button');
+            if (modalRejectBtn) {
+              await page.evaluate(el => el.click(), modalRejectBtn);
+              await page.waitForTimeout(1500);
               rejectedCount++;
-              log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min, id:${rejectModalData.id})`);
+              log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
             } else {
-              log(`F3 ⚠ Rejet API ${reqPhone}: status=${rejectResult?.status} resp=${String(rejectResult?.response||'').substring(0,60)}`);
+              log(`F3 ⚠ Bouton OK dans modale rejet non trouvé pour ${reqPhone}`);
+              await page.keyboard.press('Escape');
+              await page.waitForTimeout(300);
             }
           } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message.substring(0,80)}`); }
         } else {
