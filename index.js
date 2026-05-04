@@ -158,6 +158,57 @@ async function yapsonApprove(msgId) {
   return res.ok;
 }
 
+// ── Recherche approfondie d'un numéro dans TOUS les expéditeurs YapsonPress ──
+// Utilisée avant tout rejet : si le paiement existe et est POSTÉRIEUR à la commande → confirmer
+async function yapsonDeepSearch(phone, reqDateTs) {
+  const token = state.yapsonToken;
+  if (!token) return { found: false, payment: null };
+  try {
+    const res = await fetch(`${YAPSON_URL}/api/messages`, {
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) return { found: false, payment: null };
+    const data = await res.json();
+    const messages = Array.isArray(data) ? data : (data.messages || data.data || Object.values(data));
+
+    // Parcourir TOUS les expéditeurs, sans filtre de date
+    const candidates = [];
+    for (const msg of messages) {
+      const sender = msg.sender || '';
+      if (!SENDERS.some(s => sender.includes(s))) continue;
+      const parsed = parseMsg(sender, msg.content || msg.body || msg.message || '');
+      if (!parsed) continue;
+      if (normPhone(String(parsed.phone)) !== normPhone(String(phone))) continue;
+      let ts = msg.timestamp;
+      if (!ts) ts = new Date(msg.created_at || msg.date || '').getTime();
+      if (!ts || isNaN(ts)) continue;
+      candidates.push({
+        phone: parsed.phone,
+        amount: parsed.amount,
+        msgId: msg.id || msg._id,
+        approved: msg.status === 'approuve' || msg.status === 'approved',
+        sender,
+        ts,
+      });
+    }
+
+    if (candidates.length === 0) return { found: false, payment: null };
+
+    // Chercher un paiement dont le timestamp est >= date de la commande
+    const afterOrder = candidates.filter(c => c.ts >= reqDateTs);
+    if (afterOrder.length > 0) {
+      afterOrder.sort((a, b) => b.ts - a.ts); // le plus récent en premier
+      return { found: true, payment: afterOrder[0] };
+    }
+
+    // Paiements trouvés mais tous AVANT la commande
+    return { found: false, payment: null };
+  } catch(e) {
+    return { found: false, payment: null };
+  }
+}
+
+
 // ── Playwright : session my-managment ────────────────────────
 let browser = null;
 let page = null;
@@ -294,14 +345,114 @@ let f3Config = {
   rejectMin: F3_REJECT_MIN,
 };
 
+// ── Injecter une valeur dans un input Vue.js (méthode fiable) ─
+async function setVueInput(locator, value) {
+  await locator.evaluate((el, val) => {
+    el.focus();
+    el.select && el.select();
+    // Effacer via nativeSetter pour que Vue.js détecte le changement
+    const tag = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const nativeSetter = Object.getOwnPropertyDescriptor(tag, 'value')?.set;
+    if (nativeSetter) {
+      nativeSetter.call(el, '');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      nativeSetter.call(el, val);
+    } else {
+      el.value = val;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+  }, String(value));
+  await page.waitForTimeout(200);
+}
+
+// ── Attendre le bouton CONFIRMER dans la modale ───────────────
+async function waitModalConfirmBtn(timeoutMs = 15000) {
+  const t = Date.now();
+  while (Date.now() - t < timeoutMs) {
+    // Cacher le preloader si présent
+    await page.evaluate(() => {
+      document.querySelectorAll('.container-preloader').forEach(p => p.style.display = 'none');
+    }).catch(() => {});
+    // Chercher bouton CONFIRMER visible avec largeur suffisante
+    for (const b of await page.$$('button')) {
+      try {
+        const txt = (await b.textContent()).trim().toUpperCase();
+        const box = await b.boundingBox();
+        if (txt === 'CONFIRMER' && box && box.width > 80) return b;
+      } catch { /* ignore */ }
+    }
+    // Aussi chercher button.btn-success avec texte "Confirmer"
+    for (const b of await page.$$('button.btn-success')) {
+      try {
+        const txt = (await b.textContent()).trim();
+        const box = await b.boundingBox();
+        if (txt === 'Confirmer' && box && box.width > 50) return b;
+      } catch { /* ignore */ }
+    }
+    await page.waitForTimeout(300);
+  }
+  return null;
+}
+
+// ── Attendre fermeture de la modale ──────────────────────────
+async function waitModalClose(timeoutMs = 15000) {
+  const t = Date.now();
+  while (Date.now() - t < timeoutMs) {
+    await page.evaluate(() => {
+      document.querySelectorAll('.container-preloader').forEach(p => p.style.display = 'none');
+    }).catch(() => {});
+    let found = false;
+    for (const b of await page.$$('button')) {
+      try {
+        const txt = (await b.textContent()).trim().toUpperCase();
+        if (txt === 'CONFIRMER') { found = true; break; }
+      } catch { /* ignore */ }
+    }
+    if (!found) return true;
+    await page.waitForTimeout(300);
+  }
+  return false;
+}
+
+// ── Corriger montant + commentaire dans la modale ouverte ────
+async function fixModalAmount(montantYapson) {
+  await page.waitForTimeout(500);
+  const amtLocator = page.locator(
+    'input[placeholder="Montant"], input[placeholder="montant"], input[placeholder="Amount"], ' +
+    '[role="dialog"] input[type="number"], .modal input[type="number"]'
+  ).first();
+  const amtCount = await amtLocator.count();
+  if (amtCount > 0) {
+    await setVueInput(amtLocator, String(montantYapson));
+    log(`F3 ✏ Montant modale → ${fmtAmt(montantYapson)}F`);
+  } else {
+    log(`F3 ⚠ Champ Montant introuvable dans la modale`);
+  }
+  // Remplir aussi le champ Commentaire avec le montant SMS (trace)
+  const commLocator = page.locator(
+    'input[placeholder="Commentaire"], textarea[placeholder="Commentaire"], ' +
+    'input[placeholder="commentaire"], textarea[placeholder="commentaire"]'
+  ).first();
+  const commCount = await commLocator.count();
+  if (commCount > 0) {
+    await setVueInput(commLocator, String(montantYapson));
+  }
+}
+
 // ── F3 ────────────────────────────────────────────────────────
 async function runF3() {
   log('▶ F3 — Cycle complet YapsonSearch…');
   await ensureLoggedIn();
 
+  // ── ÉTAPE 1 : Lire les demandes en attente dans my-managment ─
   log('F3 [1/5] Lecture du tableau Pending deposit requests…');
   await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
+
+  // Désactiver l'autorefresh et charger 500 lignes
   try {
+    // Désactiver le toggle autorefresh
     const toggleInput = await page.$('input[type="checkbox"].toggle, .toggle input, input#autoUpdate, input[class*="toggle"]');
     if (toggleInput) {
       const isOn = await toggleInput.isChecked();
@@ -311,57 +462,61 @@ async function runF3() {
       if (toggleEl) await toggleEl.dispatchEvent('click');
     }
     await page.waitForTimeout(500);
-    const applyBtn = await page.$('button:has-text("APPLIQUER")');
-    if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(2000); }
-  } catch(e) { log(`⚠ Setup tableau: ${e.message.substring(0,80)}`); }
+    // Sélectionner 500 lignes via le multiselect Vue.js
+    const ms = await page.$('.input-group.select-box .multiselect, .multiselect[data-v]');
+    if (ms) {
+      const current = await page.$eval('.multiselect__single', el => el.textContent.trim()).catch(() => '');
+      if (current !== '500') {
+        const selectBtn = await ms.$('.multiselect__select');
+        if (selectBtn) { await selectBtn.click(); await page.waitForTimeout(400); }
+        const options = await ms.$$('.multiselect__element');
+        for (const opt of options) {
+          const txt = (await opt.textContent()).trim();
+          if (txt === '500') { await opt.$('span')?.click(); break; }
+        }
+        await page.waitForTimeout(300);
+      }
+    }
+    const applyBtn = await page.$('button:has-text("Appliquer"), button:has-text("APPLIQUER")');
+    if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(3000); }
+  } catch(e) { log(`⚠ Setup tableau: ${e.message.substring(0, 80)}`); }
 
+  // Lire toutes les lignes
   const pendingRows = await page.$$eval('table tbody tr', (trs) => {
     return trs.map(tr => {
       const cells = [...tr.querySelectorAll('td')].map(td => td.innerText.trim());
-      const hasConfirm = tr.innerText.includes('Confirmer') || tr.innerText.includes('Confirm');
-      const links = [...tr.querySelectorAll('a')];
-      const confirmLink = links.find(a => a.innerText?.trim() === 'Confirmer');
-      const allEls = [tr, ...tr.querySelectorAll('[data-id],[data-report],[data-subagent],[data-currency],[onclick]')];
-      let rowId = null, reportId = null, subagentId = null, currency = null;
-      for (const el of allEls) {
-        if (el.dataset?.id) rowId = el.dataset.id;
-        if (el.dataset?.reportId) reportId = el.dataset.reportId;
-        if (el.dataset?.subagent) subagentId = el.dataset.subagent;
-        if (el.dataset?.currency) currency = el.dataset.currency;
-        const onclick = el.getAttribute('onclick') || '';
-        const vClick = el.getAttribute('@click') || el.getAttribute('v-on:click') || '';
-        const src = onclick + vClick;
-        if (src) {
-          const mId = src.match(/['"](\d{10,})['"]/);
-          if (mId && !rowId) rowId = mId[1];
-        }
-      }
-      return { cells, hasConfirm, rowId, reportId, subagentId, currency,
-        hasConfirmLink: !!confirmLink };
-    }).filter(r => r.hasConfirm && r.cells.length >= 5);
+      if (cells.length < 5) return null;
+      const hasConfirm = [...tr.querySelectorAll('a')].some(a => a.textContent.trim() === 'Confirmer');
+      if (!hasConfirm) return null;
+      const phoneMatch = (cells[1] || '').match(/0\d{9}/);
+      const phone = phoneMatch ? phoneMatch[0] : null;
+      if (!phone) return null;
+      return { date: cells[0], phone, amountRaw: cells[2] };
+    }).filter(Boolean);
   });
 
   if (pendingRows.length === 0) { log('F3 — Aucune demande en attente. Fin.'); return; }
   log(`F3 — ${pendingRows.length} demande(s) en attente trouvée(s)`);
 
+  // ── ÉTAPE 2 : Trouver la plus ancienne demande → timestamp de départ ─
   const now = Date.now();
   let oldestTs = now;
   let oldestStr = null;
   for (const row of pendingRows) {
-    const dateStr = row.cells[0];
-    const d = parseMgmtDate(dateStr);
+    const d = parseMgmtDate(row.date);
     if (d && !isNaN(d.getTime()) && d.getTime() < oldestTs) {
       oldestTs = d.getTime();
-      oldestStr = dateStr;
+      oldestStr = row.date;
     }
   }
-  if (!oldestStr) { log('F3 ❌ Impossible de lire la date de création. Fin.'); return; }
-  log(`F3 — Plus ancienne demande : ${oldestStr} (il y a ${((now - oldestTs)/60000).toFixed(0)} min)`);
+  if (!oldestStr) { log('F3 ❌ Impossible de lire la date la plus ancienne. Fin.'); return; }
+  log(`F3 — Plus ancienne demande : ${oldestStr} (il y a ${((now - oldestTs) / 60000).toFixed(0)} min)`);
 
+  // ── ÉTAPE 3 : Fetch YapsonPress depuis oldestTs jusqu'à (now - marginMin) ─
   const marginMin = f3Config.marginMin;
   const rejectMin = f3Config.rejectMin;
-  const toTs = now - (marginMin * 60 * 1000);
   const fromTs = oldestTs;
+  const toTs = now - (marginMin * 60 * 1000);
   log(`F3 [2/5] Fetch YapsonPress de ${new Date(fromTs).toLocaleTimeString('fr-FR')} à ${new Date(toTs).toLocaleTimeString('fr-FR')} (marge ${marginMin}min)…`);
 
   let yapMessages;
@@ -373,6 +528,7 @@ async function runF3() {
   }
   log(`F3 — ${yapMessages.length} message(s) YapsonPress dans la fenêtre`);
 
+  // Parser les messages YapsonPress → Map par numéro de téléphone
   const payments = [];
   for (const msg of yapMessages) {
     const parsed = parseMsg(msg.sender || '', msg.content || msg.body || msg.message || '');
@@ -385,8 +541,9 @@ async function runF3() {
       sender: msg.sender,
     });
   }
-  log(`F3 — ${payments.length} paiement(s) parsé(s) : ${payments.map(p => `${p.phone}→${fmtAmt(p.amount)}F`).join(' | ')}`);
+  log(`F3 — ${payments.length} paiement(s) parsé(s) depuis YapsonPress : ${payments.map(p => `${p.phone}→${fmtAmt(p.amount)}F`).join(' | ')}`);
 
+  // ── ÉTAPE 4 : Approuver dans YapsonPress les paiements non encore approuvés ─
   log('F3 [3/5] Approbation dans YapsonPress…');
   let approvedCount = 0;
   for (const p of payments) {
@@ -398,16 +555,19 @@ async function runF3() {
   log(`F3 — ${approvedCount} paiement(s) approuvé(s) dans YapsonPress`);
   state.approved += approvedCount;
 
-  log('F3 [4/5] Confirmation des demandes dans my-managment…');
-  if (!page.url().includes('pendingrequestrefill')) {
-    await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
-    await page.waitForTimeout(1000);
-  }
-
+  // Construire un Map phone → liste de paiements YapsonPress
   const yapMap = {};
   for (const p of payments) {
     if (!yapMap[p.phone]) yapMap[p.phone] = [];
     yapMap[p.phone].push(p);
+  }
+
+  // ── ÉTAPE 5 : Confirmer/rejeter dans my-managment ─────────────
+  log('F3 [4/5] Confirmation des demandes dans my-managment…');
+  // Recharger la page pour avoir les données fraîches
+  if (!page.url().includes('pendingrequestrefill')) {
+    await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(1000);
   }
 
   let confirmedCount = 0;
@@ -420,33 +580,37 @@ async function runF3() {
     try {
       const cells = await rowHandle.locator('td').allInnerTexts();
       if (cells.length < 5) continue;
-      let reqPhone = null;
-      let reqAmount = null;
-      let reqDate = null;
-      reqDate = parseMgmtDate(cells[0]);
-      const phoneMatch = cells[1].match(/(0\d{9})/);
-      if (phoneMatch) reqPhone = normPhone(phoneMatch[1]);
-      reqAmount = parseAmount(cells[2]);
-      if (!reqPhone) continue;
+
+      // Extraire téléphone et montant de my-managment
+      const phoneMatch = (cells[1] || '').match(/(0\d{9})/);
+      if (!phoneMatch) continue;
+      const reqPhone = normPhone(phoneMatch[1]);
+      const reqAmount = parseAmount(cells[2]);
+      const reqDate = parseMgmtDate(cells[0]);
       const ageMin = reqDate ? (now - reqDate.getTime()) / 60000 : 999;
-      const matches = yapMap[reqPhone];
-      if (matches && matches.length > 0) {
-        const exactMatch = matches.find(p => p.amount === reqAmount);
-        const best = exactMatch || matches.reduce((a, b) =>
-          Math.abs(a.amount - (reqAmount||0)) <= Math.abs(b.amount - (reqAmount||0)) ? a : b
+
+      // Chercher ce numéro dans les paiements YapsonPress
+      const yapMatches = yapMap[reqPhone];
+
+      if (yapMatches && yapMatches.length > 0) {
+        // Trouver le meilleur match (exact d'abord, sinon le plus proche)
+        const exactMatch = yapMatches.find(p => p.amount === reqAmount);
+        const best = exactMatch || yapMatches.reduce((a, b) =>
+          Math.abs(a.amount - (reqAmount || 0)) <= Math.abs(b.amount - (reqAmount || 0)) ? a : b
         );
-        const montantCorrigé = best.amount;
-        if (reqAmount && reqAmount !== montantCorrigé) {
-          log(`F3 — Correction montant ${reqPhone}: my-managment=${fmtAmt(reqAmount)}F → YapsonPress=${fmtAmt(montantCorrigé)}F`);
-          try {
-            const amountInput = await rowHandle.$('input[type="number"], input[name*="amount"], input[name*="montant"]');
-            if (amountInput) {
-              await amountInput.triple_click();
-              await amountInput.fill(String(montantCorrigé));
-              await page.waitForTimeout(300);
-            }
-          } catch(e) { log(`⚠ Saisie montant: ${e.message.substring(0,60)}`); }
+
+        // Montant à appliquer : celui de YapsonPress, plafonné à 200 000
+        let montantFinal = best.amount;
+        if (montantFinal > 200000) {
+          log(`F3 ⚠ Montant YapsonPress ${fmtAmt(montantFinal)}F > 200 000 → plafonné à 200 000F`);
+          montantFinal = 200000;
         }
+
+        if (reqAmount !== montantFinal) {
+          log(`F3 — Correction montant ${reqPhone}: my-managment=${fmtAmt(reqAmount)}F → YapsonPress=${fmtAmt(montantFinal)}F`);
+        }
+
+        // Cliquer sur "Confirmer" dans la ligne
         try {
           let confirmLink = null;
           for (const a of await rowHandle.locator('a').all()) {
@@ -455,66 +619,120 @@ async function runF3() {
           if (!confirmLink) { log(`F3 ⚠ Lien Confirmer non trouvé pour ${reqPhone}`); continue; }
           await confirmLink.click();
           await page.waitForTimeout(800);
-          let modalBtn = null;
-          for (let i = 0; i < 30; i++) {
-            for (const b of await page.$$('button')) {
-              const t = (await b.textContent()).trim().toUpperCase();
-              const box = await b.boundingBox();
-              if (t === 'CONFIRMER' && box && box.width > 100) { modalBtn = b; break; }
-            }
-            if (modalBtn) break;
-            await page.waitForTimeout(300);
-          }
+
+          // Attendre l'apparition du bouton CONFIRMER dans la modale
+          const modalBtn = await waitModalConfirmBtn(15000);
           if (!modalBtn) { log(`F3 ⚠ Modale CONFIRMER non trouvée pour ${reqPhone}`); continue; }
-          if (montantCorrigé && montantCorrigé !== reqAmount) {
-            const mi = await page.$('input[placeholder="Montant"],input[placeholder="montant"]');
-            if (mi) { await mi.fill(''); await mi.fill(String(montantCorrigé)); await page.waitForTimeout(200); }
+
+          // Si montant différent : corriger dans la modale AVANT de cliquer
+          if (reqAmount !== montantFinal) {
+            await fixModalAmount(montantFinal);
+            await page.waitForTimeout(300);
           }
+
+          // Cliquer sur CONFIRMER dans la modale
           await modalBtn.click();
-          for (let i = 0; i < 30; i++) {
-            let found = false;
-            for (const b of await page.$$('button')) if ((await b.textContent()).trim().toUpperCase() === 'CONFIRMER') { found = true; break; }
-            if (!found) break;
-            await page.waitForTimeout(300);
-          }
+
+          // Attendre la fermeture de la modale
+          await waitModalClose(15000);
           await page.waitForTimeout(1000);
+
           confirmedCount++;
-          log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantCorrigé)}F`);
-        } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message.substring(0,80)}`); }
+          log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantFinal)}F`);
+        } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message.substring(0, 80)}`); }
+
       } else {
+        // Numéro PAS dans la fenêtre YapsonPress principale
         if (ageMin >= rejectMin) {
-          log(`F3 — Rejet: ${reqPhone} introuvable, âge ${ageMin.toFixed(0)} min >= ${rejectMin} min`);
-          try {
-            let rejectLink = null;
-            for (const a of await rowHandle.locator('a').all()) {
-              if ((await a.textContent()).trim() === 'Rejeter') { rejectLink = a; break; }
+          // ── VÉRIFICATION APPROFONDIE avant tout rejet ──────────────
+          // Chercher le numéro dans TOUS les expéditeurs YapsonPress,
+          // sans restriction de date, en vérifiant que le paiement
+          // est postérieur ou contemporain à la commande.
+          log(`F3 🔍 DeepSearch avant rejet : ${reqPhone} (âge ${ageMin.toFixed(0)} min)…`);
+          const reqDateTs = reqDate ? reqDate.getTime() : (now - ageMin * 60000);
+          const deepResult = await yapsonDeepSearch(reqPhone, reqDateTs);
+
+          if (deepResult.found && deepResult.payment) {
+            // Paiement trouvé APRÈS la commande → confirmer au lieu de rejeter
+            const dp = deepResult.payment;
+            let montantDeep = dp.amount;
+            if (montantDeep > 200000) {
+              log(`F3 ⚠ DeepSearch montant ${fmtAmt(montantDeep)}F > 200 000 → plafonné`);
+              montantDeep = 200000;
             }
-            if (!rejectLink) { log(`F3 ⚠ Lien Rejeter non trouvé pour ${reqPhone}`); continue; }
-            await rejectLink.click();
-            let okBtn = null;
-            for (let i = 0; i < 40; i++) {
-              for (const b of await page.$$('button, a.btn, .btn')) {
-                if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { okBtn = b; break; }
+            log(`F3 🔍 DeepSearch ${reqPhone} : paiement trouvé chez ${dp.sender} le ${new Date(dp.ts).toLocaleTimeString('fr-FR')} → ${fmtAmt(montantDeep)}F — CONFIRMATION au lieu de rejet`);
+
+            // Approuver dans YapsonPress si pas encore fait
+            if (!dp.approved && dp.msgId) {
+              await yapsonApprove(dp.msgId);
+            }
+
+            try {
+              let confirmLink = null;
+              for (const a of await rowHandle.locator('a').all()) {
+                if ((await a.textContent()).trim() === 'Confirmer') { confirmLink = a; break; }
               }
-              if (okBtn) break;
-              await page.waitForTimeout(200);
-            }
-            if (!okBtn) { log(`F3 ⚠ Bouton OK rejet non trouvé pour ${reqPhone}`); continue; }
-            await page.waitForTimeout(300);
-            const ci = await page.$('input[placeholder="Commentaire"],textarea[placeholder="Commentaire"]');
-            if (ci) { await ci.fill('Expiré'); await page.waitForTimeout(200); }
-            for (const b of await page.$$('button, a.btn, .btn')) {
-              if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { await b.click(); break; }
-            }
-            await page.waitForTimeout(2000);
-            rejectedCount++;
-            log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
-          } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message.substring(0,80)}`); }
+              if (!confirmLink) { log(`F3 ⚠ Lien Confirmer (deep) non trouvé pour ${reqPhone}`); continue; }
+              await confirmLink.click();
+              await page.waitForTimeout(800);
+
+              const modalBtn = await waitModalConfirmBtn(15000);
+              if (!modalBtn) { log(`F3 ⚠ Modale CONFIRMER (deep) non trouvée pour ${reqPhone}`); continue; }
+
+              // Corriger le montant si différent
+              if (reqAmount !== montantDeep) {
+                await fixModalAmount(montantDeep);
+                await page.waitForTimeout(300);
+              }
+
+              await modalBtn.click();
+              await waitModalClose(15000);
+              await page.waitForTimeout(1000);
+
+              confirmedCount++;
+              log(`F3 ✅ Confirmé (via DeepSearch) : ${reqPhone} → ${fmtAmt(montantDeep)}F`);
+            } catch(e) { log(`⚠ Confirmation deep ${reqPhone}: ${e.message.substring(0, 80)}`); }
+
+          } else {
+            // Vraiment introuvable → rejeter
+            log(`F3 — Rejet définitif: ${reqPhone} introuvable dans YapsonPress (tous expéditeurs), âge ${ageMin.toFixed(0)} min`);
+            try {
+              let rejectLink = null;
+              for (const a of await rowHandle.locator('a').all()) {
+                if ((await a.textContent()).trim() === 'Rejeter') { rejectLink = a; break; }
+              }
+              if (!rejectLink) { log(`F3 ⚠ Lien Rejeter non trouvé pour ${reqPhone}`); continue; }
+              await rejectLink.click();
+              let okBtn = null;
+              for (let i = 0; i < 40; i++) {
+                for (const b of await page.$$('button, a.btn, .btn')) {
+                  try {
+                    if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { okBtn = b; break; }
+                  } catch { /* ignore */ }
+                }
+                if (okBtn) break;
+                await page.waitForTimeout(200);
+              }
+              if (!okBtn) { log(`F3 ⚠ Bouton OK rejet non trouvé pour ${reqPhone}`); continue; }
+              await page.waitForTimeout(300);
+              const ci = await page.$('input[placeholder="Commentaire"], textarea[placeholder="Commentaire"]');
+              if (ci) { await ci.fill('Expiré'); await page.waitForTimeout(200); }
+              for (const b of await page.$$('button, a.btn, .btn')) {
+                try {
+                  if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { await b.click(); break; }
+                } catch { /* ignore */ }
+              }
+              await page.waitForTimeout(2000);
+              rejectedCount++;
+              log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
+            } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message.substring(0, 80)}`); }
+          }
+
         } else {
-          log(`F3 ⏳ En attente: ${reqPhone} introuvable mais âge ${ageMin.toFixed(0)} min < ${rejectMin} min`);
+          log(`F3 ⏳ En attente: ${reqPhone} introuvable (fenêtre principale) — âge ${ageMin.toFixed(0)} min < ${rejectMin} min`);
         }
       }
-    } catch(e) { log(`⚠ Erreur ligne: ${e.message}`); }
+    } catch(e) { log(`⚠ Erreur ligne ${ri}: ${e.message.substring(0, 80)}`); }
   }
 
   log(`F3 [5/5] ✅ Résultat : ${confirmedCount} confirmé(s), ${rejectedCount} rejeté(s), ${approvedCount} approuvé(s) YapsonPress`);
